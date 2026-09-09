@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+
+    # The ingest seam, the watermark and the queue enqueue all live in Postgres,
+    # and the defects this suite exists to catch -- a watermark advancing after a
+    # failure, an ON CONFLICT that fires when it should not, a dedup_key that
+    # does not dedup -- are invisible to a mock, which hands back whatever the
+    # code asked for.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Lint with ruff
+        run: uv run ruff check .
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      # AGENT-REVIEWERS.md's complexity-reviewer defers the mechanical part of
+      # its job to this ceiling; without it the reviewer re-derives by eye.
+      - name: Complexity ceiling
+        # The ceiling itself lives in [tool.ruff.lint.mccabe]; --max-complexity
+        # is not a ruff CLI flag. Kept as its own step so a complexity failure
+        # is legible in the job list rather than buried in the lint step.
+        run: uv run ruff check --select C901 .
+
+      - name: Type check
+        run: uv run mypy src
+
+      - name: Security lint
+        run: uv run bandit -r src -c pyproject.toml
+
+      - name: Dead code
+        run: uv run vulture src vulture_whitelist.py --min-confidence 80
+
+      - name: Run tests
+        env:
+          CORTEX_TEST_DSN: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres"
+        run: uv run pytest -v --cov=src/cortex_slack --cov-report=term-missing
+
+      - name: Fail if the live-Postgres tests were skipped
+        env:
+          CORTEX_TEST_DSN: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=postgres"
+          # This, not `-p no:skipping`, is what makes the guard bite. That flag
+          # disables the skip/skipif MARKER plugin; the DSN fixture raises a
+          # runtime pytest.skip(), which it does not touch -- measured at exit 0
+          # with no DSN, i.e. a guard against silent skipping that silently
+          # skipped. CORTEX_REQUIRE_LIVE turns that skip into a failure.
+          CORTEX_REQUIRE_LIVE: "1"
+        # Live tests are selected by marker rather than by filename, so a new
+        # one is covered the day it is written rather than the day someone
+        # remembers to add it here -- which is how cortex-utils' equivalent
+        # step grew a hand-maintained roster of five paths.
+        #
+        # `pytest -m live` exits 5 when it collects nothing, which fails this
+        # step. That is correct: a repo whose live coverage has vanished should
+        # not report green.
+        run: uv run pytest -m live -q --no-header -p no:cacheprovider
