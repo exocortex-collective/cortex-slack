@@ -1,0 +1,23 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Derived output. Postgres is the system of record; these trees are rebuilt by
+# the export worker and must never be committed -- the repo they came from
+# carried 313 meeting notes and transcripts in its history.
+notes/
+transcripts/
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+
+# Coverage / tooling
+.coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
