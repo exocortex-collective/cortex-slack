@@ -139,7 +139,14 @@ def clean(schema: psycopg2.extensions.connection) -> psycopg2.extensions.connect
     would delete their work.
     """
     with schema.cursor() as cur:
+        # Every table this service owns, not only the one the derived rows
+        # cascade from: slack_backfill_jobs and slack_sync_state are written
+        # directly, so leaving them would leak a previous test's jobs and
+        # watermarks into the next one -- and the failure lands on the innocent
+        # test, which is how this cost an afternoon the first time.
         cur.execute("TRUNCATE slack_messages_raw CASCADE")
+        cur.execute("TRUNCATE slack_backfill_jobs")
+        cur.execute("TRUNCATE slack_sync_state")
         cur.execute("DELETE FROM queue WHERE queue_name = 'slack_parse'")
     schema.commit()
     return schema

@@ -228,6 +228,43 @@ class SlackClient:
     def list_users(self) -> Iterator[dict[str, Any]]:
         yield from self._paginate("users.list", "members", {})
 
+    def history_pages(
+        self,
+        channel: str,
+        *,
+        oldest: str | None = None,
+        latest: str | None = None,
+        cursor: str | None = None,
+    ) -> Iterator[tuple[list[dict[str, Any]], str | None]]:
+        """History a page at a time, yielding (messages, cursor_after_this_page).
+
+        The page-level form exists so a caller can checkpoint. `history()` hides
+        the cursor, which is right for a poller reading a small window and wrong
+        for a backfill on a machine that suspends without warning: without the
+        cursor, an interrupted conversation restarts from the top, and a large
+        one may never finish.
+
+        `cursor` resumes a previous walk. The yielded cursor is what to store to
+        resume *after* the page just handed over -- store it only once that
+        page's messages are safely written, or a crash between the two loses
+        them silently.
+        """
+        params: dict[str, Any] = {"channel": channel}
+        if oldest is not None:
+            params["oldest"] = validate_ts(oldest, field="oldest")
+        if latest is not None:
+            params["latest"] = validate_ts(latest, field="latest")
+
+        while True:
+            page = self._post(
+                "conversations.history", {**params, "limit": PAGE_LIMIT, "cursor": cursor}
+            )
+            messages: list[dict[str, Any]] = page.get("messages") or []
+            cursor = (page.get("response_metadata") or {}).get("next_cursor") or None
+            yield messages, cursor
+            if not cursor:
+                return
+
     def history(
         self, channel: str, *, oldest: str | None = None, latest: str | None = None
     ) -> Iterator[dict[str, Any]]:
