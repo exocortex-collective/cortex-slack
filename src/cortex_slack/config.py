@@ -18,9 +18,13 @@ SCHEMA_LOCK_NAME = "cortex_slack_schema"
 
 # Slack's browser-session tokens. Phase 1 only: an internal Slack app replaces
 # these in phase 2 and the token file goes away with them.
+# \Z rather than $, for the same reason as TS_PATTERN in slack/api.py: `$` also
+# matches before a trailing newline, so a token with one would validate here and
+# then authenticate as nobody. These values are pasted by hand, so that is the
+# likely shape of a bad one.
 _TOKEN_PATTERNS = {
-    "SLACK_XOXC_TOKEN": re.compile(r"^xoxc-[A-Za-z0-9-]+$"),
-    "SLACK_XOXD_TOKEN": re.compile(r"^xoxd-[A-Za-z0-9%/+=-]+$"),
+    "SLACK_XOXC_TOKEN": re.compile(r"^xoxc-[A-Za-z0-9-]+\Z"),
+    "SLACK_XOXD_TOKEN": re.compile(r"^xoxd-[A-Za-z0-9%/+=-]+\Z"),
 }
 
 

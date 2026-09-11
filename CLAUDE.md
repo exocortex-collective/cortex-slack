@@ -14,6 +14,23 @@ about X".
 **Scope, settled and not a review topic:** everything Devon's own account can
 see, DMs included. Same visibility as his own Slack search; no new exposure.
 
+## Admin scope is refused, not merely unused
+
+The phase-1 session token carries `admin` scope, because the account has it.
+The archive must not spend it: `SlackClient._post` raises `AdminMethodRefused`
+for any method beginning `admin.`, and every request in the client goes through
+that one boundary.
+
+This is a guard rather than a convention because "we agreed not to" is not a
+property anyone can verify by reading the code — and the whole premise of the
+archive is that it records only what the account could already read through
+Slack's own UI. Admin endpoints would widen that to the workspace, quietly and
+without any visible difference in the output.
+
+Reading a public channel the account has not joined is **not** admin reach —
+any member can open one — so those are in scope. Anything requiring `admin.*` is
+not, and is not a judgement call to make per-endpoint.
+
 ## The constraint that shapes everything
 
 Slack limited `conversations.history` and `conversations.replies` to **1
