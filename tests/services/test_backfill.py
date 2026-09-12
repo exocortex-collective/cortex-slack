@@ -313,3 +313,25 @@ def test_an_api_error_fails_the_job_without_raising(
 
     assert result is not None and result.errors == 1
     assert _job(clean, C1)[0] == "failed"
+
+
+def test_the_backfill_does_not_fill_the_shared_queue(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """History is found by query, not by queue.
+
+    At this workspace's scale queueing history would add ~600k rows to the
+    shared table gmail-sync, parse-worker and triage-worker all claim from --
+    which already holds 336k and is unpartitioned. The raw row is itself the
+    record that parsing is outstanding, so the job adds only contention.
+    """
+    seed_jobs(clean, [{"id": C1}])
+    client = _PagedClient([[_msg("1725379200.000001"), _msg("1725379100.000002")]])
+
+    run_next_job(clean, client)  # type: ignore[arg-type]
+
+    with clean.cursor() as cur:
+        cur.execute("SELECT count(*) FROM queue WHERE queue_name = 'slack_parse'")
+        row = cur.fetchone()
+    assert row is not None and row[0] == 0, "backfill queued parse jobs"
+    assert len(_stored(clean, C1)) == 2, "and the messages are still archived"

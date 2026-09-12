@@ -42,7 +42,7 @@ def dsn_from_env() -> str:
         database=os.environ.get("POSTGRES_DB", "cortex"),
         user=os.environ.get("POSTGRES_USER", "cortex"),
         password=os.environ.get("POSTGRES_PASSWORD", "cortex"),
-    ).dsn()
+    ).dsn
     return dsn
 
 

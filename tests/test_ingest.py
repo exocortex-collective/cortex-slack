@@ -165,3 +165,22 @@ def test_a_non_unchanged_result_may_have_no_job_id() -> None:
 def test_message_key_separates_the_halves() -> None:
     assert message_key("C0AAA", "1725379200.001500") == "C0AAA/1725379200.001500"
     assert message_key("C0AAA", "1") != message_key("C0AAA1", "")
+
+
+def test_enqueue_can_be_skipped_without_losing_the_message(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """The raw row is the record that work is outstanding.
+
+    A query-driven parse worker finds it by anti-join, so skipping the queue
+    loses nothing -- which is what makes the bulk backfill safe to run against
+    a shared queue the email pipeline depends on.
+    """
+    result = ingest_message(
+        clean, CHANNEL, _message("1725379200.001500"), source="backfill", enqueue_parse=False
+    )
+
+    assert result.outcome is Outcome.STORED
+    assert result.job_id is None
+    assert len(_raw_rows(clean)) == 1
+    assert _queued(clean) == 0

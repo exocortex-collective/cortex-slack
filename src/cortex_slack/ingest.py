@@ -74,6 +74,7 @@ def ingest_message(
     *,
     source: str,
     priority: int = 0,
+    enqueue_parse: bool = True,
 ) -> IngestResult:
     """Store one raw message and enqueue parsing. Idempotent.
 
@@ -87,6 +88,15 @@ def ingest_message(
     parse job land together or not at all; a committed row with no job is a
     message that never gets parsed and that nothing will retry, because the next
     poll sees it as unchanged.
+
+    `enqueue_parse=False` skips the job, for the bulk backfill. The queue is the
+    right mechanism for live arrivals -- small volume, latency matters -- and the
+    wrong one for history: a full backfill of this workspace would add roughly
+    600,000 rows to a shared, unpartitioned table that gmail-sync, parse-worker
+    and triage-worker all claim from, and which already holds 336,000. The parse
+    worker finds backfilled messages by query instead (raw rows with no parsed
+    row), so nothing is lost by not queueing them -- the raw row IS the record
+    that work is outstanding.
     """
     ts = message.get("ts")
     if not ts:
@@ -120,6 +130,9 @@ def ingest_message(
         return IngestResult(channel_id, ts, Outcome.UNCHANGED)
 
     outcome = Outcome.STORED if row[0] else Outcome.UPDATED
+    if not enqueue_parse:
+        return IngestResult(channel_id, ts, outcome)
+
     job_id = enqueue(
         conn,
         PARSE_QUEUE,

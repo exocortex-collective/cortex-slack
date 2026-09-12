@@ -27,6 +27,13 @@ logger = get_logger(__name__)
 
 SOURCE = "backfill"
 
+# The backfill does not queue parse jobs. At this workspace's scale that would
+# add ~600k rows to the shared queue the email pipeline claims from, which
+# already holds 336k and is unpartitioned. The parse worker finds backfilled
+# messages by query instead -- a raw row with no parsed row IS the record that
+# work is outstanding, so the queue adds nothing here but contention.
+ENQUEUE_PARSE = False
+
 
 @dataclass(frozen=True)
 class ChannelResult:
@@ -131,7 +138,9 @@ def _walk_channel(
     for messages, next_cursor in client.history_pages(channel_id, cursor=cursor):
         for message in messages:
             try:
-                outcome = ingest_message(conn, channel_id, message, source=SOURCE).outcome
+                outcome = ingest_message(
+                    conn, channel_id, message, source=SOURCE, enqueue_parse=ENQUEUE_PARSE
+                ).outcome
             except Exception as exc:  # noqa: BLE001 - one bad message must not end the channel
                 # Counted, not swallowed: errors keep the job from being marked
                 # done, so the watermark never advances past a conversation we
@@ -180,7 +189,7 @@ def _walk_thread(
     errors = 0
     for reply in client.replies(channel_id, thread_ts):
         try:
-            ingest_message(conn, channel_id, reply, source=SOURCE)
+            ingest_message(conn, channel_id, reply, source=SOURCE, enqueue_parse=ENQUEUE_PARSE)
         except Exception as exc:  # noqa: BLE001
             errors += 1
             logger.warning(
