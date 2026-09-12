@@ -53,14 +53,30 @@ class ChannelResult:
         return self.errors == 0
 
 
-def seed_jobs(conn: psycopg2.extensions.connection, channels: list[dict[str, Any]]) -> int:
-    """Create one pending job per conversation. Idempotent.
+def seed_jobs(
+    conn: psycopg2.extensions.connection,
+    channels: list[dict[str, Any]],
+    *,
+    include_done: bool = False,
+) -> int:
+    """Create one pending job per conversation. Idempotent across restarts.
+
+    Skips channels that already have a job in ANY terminal or active state,
+    `done` included. Only checking pending/running looks idempotent and is not:
+    this service is built to be stopped and restarted, and on each restart every
+    already-finished conversation would be queued again, so a run that is
+    interrupted often enough never converges. Observed doing exactly that --
+    three completed channels were re-queued on the second start.
+
+    `include_done=True` re-queues finished conversations deliberately, for a
+    full re-scan. Re-reading is idempotent, so it costs requests and nothing
+    else.
 
     Ordered so the corpus that matters lands first: conversations the account is
-    actually in, before public channels it merely can read. A weekend run that
-    gets interrupted should have the DMs and joined channels done, not a
-    random prefix.
+    actually in, before public channels it merely can read. An interrupted run
+    should have the DMs and joined channels done, not a random prefix.
     """
+    states = ("pending", "running") if include_done else ("pending", "running", "done")
     created = 0
     with conn.cursor() as cur:
         for channel in _ordered(channels):
@@ -70,10 +86,10 @@ def seed_jobs(conn: psycopg2.extensions.connection, channels: list[dict[str, Any
                 SELECT %s
                  WHERE NOT EXISTS (
                        SELECT 1 FROM slack_backfill_jobs
-                        WHERE channel_id = %s AND status IN ('pending', 'running')
+                        WHERE channel_id = %s AND status = ANY(%s)
                  )
                 """,
-                (channel["id"], channel["id"]),
+                (channel["id"], channel["id"], list(states)),
             )
             created += cur.rowcount
     conn.commit()

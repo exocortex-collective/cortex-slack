@@ -335,3 +335,45 @@ def test_the_backfill_does_not_fill_the_shared_queue(
         row = cur.fetchone()
     assert row is not None and row[0] == 0, "backfill queued parse jobs"
     assert len(_stored(clean, C1)) == 2, "and the messages are still archived"
+
+
+def test_reseeding_does_not_requeue_finished_conversations(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """Restarts must converge.
+
+    Only skipping pending/running looks idempotent and is not: this service is
+    built to be stopped and restarted, so every restart would re-queue the whole
+    workspace and a frequently-interrupted run would never finish. Observed
+    live -- three completed channels were re-queued on the second start.
+    """
+    seed_jobs(clean, [{"id": C1}])
+    run_next_job(clean, _PagedClient([[_msg("1725379200.000001")]]))  # type: ignore[arg-type]
+    assert _job(clean, C1)[0] == "done"
+
+    assert seed_jobs(clean, [{"id": C1}]) == 0, "re-queued a finished conversation"
+
+
+def test_a_full_rescan_can_be_asked_for_explicitly(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """Skipping done by default must not make a deliberate re-scan impossible."""
+    seed_jobs(clean, [{"id": C1}])
+    run_next_job(clean, _PagedClient([[_msg("1725379200.000001")]]))  # type: ignore[arg-type]
+
+    assert seed_jobs(clean, [{"id": C1}], include_done=True) == 1
+
+
+def test_a_failed_conversation_is_retried_on_the_next_run(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Skipping done must not also skip failed -- that would strand it."""
+    seed_jobs(clean, [{"id": C1}])
+    monkeypatch.setattr(
+        backfill, "ingest_message", lambda *a, **k: (_ for _ in ()).throw(ValueError("x"))
+    )
+    run_next_job(clean, _PagedClient([[_msg("1725379200.000001")]]))  # type: ignore[arg-type]
+    assert _job(clean, C1)[0] == "failed"
+    monkeypatch.undo()
+
+    assert seed_jobs(clean, [{"id": C1}]) == 1, "a failed conversation was never retried"
