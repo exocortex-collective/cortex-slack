@@ -91,6 +91,17 @@ SELECT file_id, raw
 # else -- timeouts, 5xx, connection resets -- is transient and stays pending.
 PERMANENT_STATUSES = frozenset({401, 403, 404, 410})
 
+# How many files in a row must answer with a sign-in page before the session
+# itself is presumed dead.
+#
+# One is not enough, which is what the first version assumed. Observed: 863
+# files downloaded cleanly and then the 864th returned HTML, stopping the whole
+# run -- a file whose url_private redirects offsite, or one in a channel whose
+# access changed, is a per-file condition and says nothing about the token. A
+# genuinely dead session fails every file, so a short run of them is the signal
+# that actually distinguishes the two.
+CREDENTIAL_FAILURES_BEFORE_STOPPING = 5
+
 
 def discover_files(conn: psycopg2.extensions.connection, limit: int = 500) -> int:
     """Record every file referenced by the raw archive. Returns NEW files found.
@@ -210,6 +221,7 @@ def store_pending(
         rows = cur.fetchall()
 
     stored = failed = 0
+    consecutive_html = 0
     for file_id, raw in rows:
         url = raw.get("url_private_download") or raw.get("url_private")
         if not url:
@@ -232,18 +244,25 @@ def store_pending(
             _mark_unfetchable(conn, file_id, str(exc))
             continue
         except CredentialsRejected as exc:
-            # MUST precede the broad handler. This was a PermissionError, which
-            # is an OSError subclass, so the clause below caught it first and the
-            # stop-everything branch was unreachable -- a dead credential would
-            # have been logged as an ordinary failure while the loop ground
-            # through four thousand files that could never succeed.
-            logger.error("credentials rejected; stopping", file_id=file_id, error=str(exc))
-            raise
+            # MUST precede the broad handler: this used to be a PermissionError,
+            # an OSError subclass, so the clause below caught it first and this
+            # branch was unreachable.
+            consecutive_html += 1
+            if consecutive_html >= CREDENTIAL_FAILURES_BEFORE_STOPPING:
+                logger.error(
+                    "sign-in page for several files in a row; session is dead, stopping",
+                    file_id=file_id,
+                    consecutive=consecutive_html,
+                )
+                raise
+            _mark_unfetchable(conn, file_id, f"sign-in page: {exc}")
+            continue
         except (urllib.error.URLError, OSError, ValueError) as exc:
             failed += 1
             logger.warning("file download failed", file_id=file_id, error=str(exc))
             continue
 
+        consecutive_html = 0
         key = s3_key_for(file_id, raw.get("name"))
         s3.put_bytes(key, data)
         with conn.cursor() as cur:

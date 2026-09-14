@@ -98,29 +98,33 @@ def test_a_stored_file_is_recorded_with_its_key(
     assert _pending(clean) == 0
 
 
-def test_a_sign_in_page_stops_everything_rather_than_being_stored(
+def test_a_sign_in_page_is_never_stored_as_if_it_were_the_file(
     clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The failure that would otherwise look like success.
 
     Slack answers an unauthenticated file request with an HTML sign-in page and
     status 200. Stored, it is indistinguishable from the file having been
-    archived -- so it must stop the pass, not count as one more failure among
-    thousands.
+    archived -- the row says s3_key, the object exists, and nobody finds out
+    until they open it.
+
+    Whether it also stops the run is a separate question, answered by how many
+    arrive in a row; what must never happen is writing the page to the bucket.
     """
-    for i in range(3):
-        _ingest_with_file(clean, f"172537920{i}.000001", _file(f"F{i}"))
+    _ingest_with_file(clean, "1725379200.000001", _file())
     discover_files(clean)
+    monkeypatch.setattr(
+        media_worker,
+        "download",
+        lambda *a, **k: (_ for _ in ()).throw(media_worker.CredentialsRejected("html")),
+    )
+    s3 = _FakeS3()
 
-    def _sign_in_page(*_a: Any, **_k: Any) -> bytes:
-        raise CredentialsRejected("got an HTML page, not the file")
+    stored, _failed, _selected = store_pending(clean, s3, "xoxc", "xoxd")
 
-    monkeypatch.setattr(media_worker, "download", _sign_in_page)
-
-    with pytest.raises(CredentialsRejected):
-        store_pending(clean, _FakeS3(), "xoxc", "xoxd")
-
-    assert _pending(clean) == 3, "marked files done despite storing nothing"
+    assert stored == 0
+    assert s3.objects == {}, "wrote a sign-in page into the bucket"
+    assert _pending(clean) == 0, "left it pending, so it will be re-fetched forever"
 
 
 def test_credentials_rejected_is_not_an_oserror() -> None:
@@ -303,3 +307,71 @@ def test_an_oversized_file_is_permanent_not_transient(
 def test_file_too_large_is_not_a_value_error() -> None:
     """Or the transient handler catches it and the fix does nothing."""
     assert not issubclass(media_worker.FileTooLarge, ValueError)
+
+
+def test_one_sign_in_page_does_not_stop_the_run(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single HTML response says nothing about the session.
+
+    Observed: 863 files downloaded cleanly and the 864th returned a sign-in
+    page, which stopped the whole run. A file whose url_private redirects
+    offsite, or one in a channel whose access changed, is a per-file condition.
+    """
+    for i in range(3):
+        _ingest_with_file(clean, f"172537920{i}.000001", _file(f"F{i}"))
+    discover_files(clean)
+    calls = {"n": 0}
+
+    def _one_bad_file(*_a: Any, **_k: Any) -> bytes:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise media_worker.CredentialsRejected("got an HTML page, not the file")
+        return b"PNGDATA"
+
+    monkeypatch.setattr(media_worker, "download", _one_bad_file)
+
+    stored, failed, selected = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+
+    assert stored == 2, "one odd file stopped the other two"
+    assert selected == 3
+    assert _fetch_error(clean, "F0") is not None and "sign-in page" in _fetch_error(clean, "F0")
+
+
+def test_a_run_of_sign_in_pages_does_stop_the_run(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dead session fails every file, and must not be ground through."""
+    for i in range(8):
+        _ingest_with_file(clean, f"17253792{i:02d}.000001", _file(f"F{i}"))
+    discover_files(clean)
+    monkeypatch.setattr(
+        media_worker,
+        "download",
+        lambda *a, **k: (_ for _ in ()).throw(media_worker.CredentialsRejected("html")),
+    )
+
+    with pytest.raises(media_worker.CredentialsRejected):
+        store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+
+
+def test_a_success_resets_the_credential_failure_run(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scattered odd files must not accumulate into a false 'session dead'."""
+    for i in range(9):
+        _ingest_with_file(clean, f"17253792{i:02d}.000001", _file(f"F{i}"))
+    discover_files(clean)
+    calls = {"n": 0}
+
+    def _alternating(*_a: Any, **_k: Any) -> bytes:
+        calls["n"] += 1
+        if calls["n"] % 2:
+            raise media_worker.CredentialsRejected("html")
+        return b"PNGDATA"
+
+    monkeypatch.setattr(media_worker, "download", _alternating)
+
+    stored, _failed, _selected = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+
+    assert stored == 4, "alternating failures were mistaken for a dead session"
