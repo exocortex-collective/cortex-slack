@@ -125,15 +125,24 @@ def parse_batch(
 
 
 def _row_for(channel_id: str, ts: str, raw: dict[str, Any]) -> tuple[Any, ...]:
+    # A file_comment keeps the person's words in raw.comment.comment and their
+    # id in raw.comment.user; the top-level `text` is Slack's wrapper prose
+    # ("<@U1> commented on <@U2>'s file") and the top-level `user` is absent on
+    # all 69 of them. Reading only the top level stored the wrapper and lost the
+    # comment.
+    raw_comment = raw.get("comment")
+    comment: dict[str, Any] = raw_comment if isinstance(raw_comment, dict) else {}
+    is_file_comment = raw.get("subtype") == "file_comment"
+
     return (
         channel_id,
         ts,
         raw.get("thread_ts"),
         # A bot post carries no user; the column stays null rather than
         # inventing an id, and the `automated` tag is how those are found.
-        raw.get("user"),
+        raw.get("user") or comment.get("user"),
         raw.get("subtype"),
-        raw.get("text"),
+        comment.get("comment") if is_file_comment else raw.get("text"),
         Json(raw.get("blocks")) if raw.get("blocks") is not None else None,
         Json(raw.get("reactions")) if raw.get("reactions") is not None else None,
         int(raw.get("reply_count") or 0),

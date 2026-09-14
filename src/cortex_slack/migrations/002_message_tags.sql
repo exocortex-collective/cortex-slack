@@ -19,8 +19,25 @@ CREATE INDEX IF NOT EXISTS idx_slack_messages_tags ON slack_messages USING GIN (
 -- 89% of this workspace is automated and one alert channel is 82% of the whole
 -- archive, so this view is the difference between a queryable corpus and a
 -- firehose.
+-- Columns are named, not `m.*`.
+--
+-- apply_schema() re-runs every migration on each service boot, and `m.*` is
+-- expanded at creation time. The next column added to slack_messages would
+-- re-expand ahead of channel_name, and CREATE OR REPLACE VIEW may only append
+-- columns -- so Postgres would raise "cannot change name of view column", the
+-- whole concatenated DDL would abort, and all three services would fail to
+-- start on a migration that had nothing to do with this view.
+--
+-- LEFT JOIN, not JOIN. 001 states the design intent: there is deliberately no
+-- foreign key to slack_channels, because an adapter can reach a message in a
+-- channel the channel sweep has not recorded yet. An inner join turns that
+-- expected state into messages silently vanishing from the default read. A null
+-- channel_name is a visible gap; a missing row is not.
 CREATE OR REPLACE VIEW slack_human_messages AS
-SELECT m.*, c.name AS channel_name, c.kind AS channel_kind
+SELECT m.channel_id, m.ts, m.thread_ts, m.user_id, m.subtype, m.text,
+       m.blocks, m.reactions, m.reply_count, m.edited_at, m.posted_at,
+       m.parsed_at, m.tags,
+       c.name AS channel_name, c.kind AS channel_kind
   FROM slack_messages m
-  JOIN slack_channels c ON c.channel_id = m.channel_id
+  LEFT JOIN slack_channels c ON c.channel_id = m.channel_id
  WHERE NOT (m.tags && ARRAY['automated', 'system']);

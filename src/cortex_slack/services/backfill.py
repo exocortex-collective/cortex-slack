@@ -27,6 +27,11 @@ logger = get_logger(__name__)
 
 SOURCE = "backfill"
 
+# How long a 'running' job may go untouched before another run may take it.
+# _record_progress touches updated_at on every page, so a live job is never
+# stolen; only one abandoned by a crash or a stop signal is.
+STALE_LEASE = "30 minutes"
+
 # The backfill does not queue parse jobs. At this workspace's scale that would
 # add ~600k rows to the shared queue the email pipeline claims from, which
 # already holds 336k and is unpartitioned. The parse worker finds backfilled
@@ -137,6 +142,15 @@ def run_next_job(conn: psycopg2.extensions.connection, client: SlackClient) -> C
         _fail(conn, job_id, str(exc))
         logger.error("backfill failed", channel=channel_id, job=job_id, error=str(exc))
         return ChannelResult(channel_id, errors=1)
+    except BaseException as exc:
+        # Includes KeyboardInterrupt and SystemExit, which is how this service
+        # normally stops. Without this the job stays 'running' and, since
+        # seed_jobs skips 'running', the channel is never worked again while the
+        # next run reports "backfill complete". The stale-lease reclaim in
+        # _claim is the backstop; this makes a deliberate stop cost nothing
+        # instead of thirty minutes.
+        _release(conn, job_id, f"interrupted: {exc!r}")
+        raise
 
     _finish(conn, job_id, channel_id, result)
     logger.info(
@@ -162,24 +176,32 @@ def _walk_channel(
     stored = updated = unchanged = threads = replies = errors = 0
 
     for messages, next_cursor in client.history_pages(channel_id, cursor=cursor):
+        errors_before_page = errors
         for message in messages:
+            with conn.cursor() as cur:
+                cur.execute("SAVEPOINT msg")
             try:
                 outcome = ingest_message(
                     conn, channel_id, message, source=SOURCE, enqueue_parse=ENQUEUE_PARSE
                 ).outcome
             except Exception as exc:  # noqa: BLE001 - one bad message must not end the channel
-                # Counted, not swallowed: errors keep the job from being marked
-                # done, so the watermark never advances past a conversation we
-                # only partly read. That is the granola bug as an invariant.
+                # ROLLBACK TO SAVEPOINT, not conn.rollback(). ingest_message does
+                # not commit, so the open transaction holds every message of this
+                # page plus the replies walked from them -- a plain rollback threw
+                # all of them away while the counters kept claiming they were
+                # stored, and the cursor below then committed past them.
                 errors += 1
+                with conn.cursor() as cur:
+                    cur.execute("ROLLBACK TO SAVEPOINT msg")
                 logger.warning(
                     "message ingest failed",
                     channel=channel_id,
                     ts=message.get("ts"),
                     error=str(exc),
                 )
-                conn.rollback()
                 continue
+            with conn.cursor() as cur:
+                cur.execute("RELEASE SAVEPOINT msg")
 
             if outcome is Outcome.STORED:
                 stored += 1
@@ -196,10 +218,18 @@ def _walk_channel(
 
         # The page's messages and the cursor that moves past it commit together.
         # Storing the cursor first would skip this page's messages after a crash;
-        # storing it later would re-read them, which is merely wasteful. They go
-        # in one transaction so neither happens.
-        _record_progress(conn, job_id, stored, next_cursor)
+        # storing it later would re-read them, which is merely wasteful.
+        #
+        # A page that errored does NOT advance the cursor. Re-reading it costs
+        # requests; moving past a message that is not in the database cannot be
+        # undone, and a later _release keeps the cursor while discarding the
+        # in-memory error count -- so the next run would see a clean pass and
+        # advance the watermark over the gap.
+        clean_page = errors == errors_before_page
+        _record_progress(conn, job_id, stored, next_cursor if clean_page else cursor)
         conn.commit()
+        if clean_page:
+            cursor = next_cursor
 
     return ChannelResult(channel_id, stored, updated, unchanged, threads, replies, errors)
 
@@ -222,7 +252,11 @@ def _walk_thread(
             # the history walk that got us here. Counting it again turns the
             # undercount this fix was for into an overcount, which is no more
             # reconcilable against the row count than the original was.
-            if reply.get("ts") != thread_ts:
+            # A thread_broadcast is returned by conversations.history AND by
+            # conversations.replies, and its ts differs from thread_ts, so
+            # counting it here counts it twice. Measured: exactly 4,319 of them,
+            # which is precisely how far the total over-reported.
+            if reply.get("ts") != thread_ts and reply.get("subtype") != "thread_broadcast":
                 ingested += 1
         except Exception as exc:  # noqa: BLE001
             errors += 1
@@ -262,13 +296,22 @@ def _claim(conn: psycopg2.extensions.connection) -> tuple[int, str, str | None] 
                SET status = 'running', updated_at = NOW()
              WHERE id = (
                    SELECT id FROM slack_backfill_jobs
+                    -- Reclaim a stale lease as well as taking new work. Only
+                    -- SlackAuthError and SlackError hand a job back; every other
+                    -- exit -- SIGTERM, the laptop suspending, a psycopg2 error on
+                    -- commit -- left it 'running' forever, and since seed_jobs
+                    -- skips 'running' the channel was never worked again. The run
+                    -- then logged "backfill complete" over a silently short
+                    -- archive. updated_at was already maintained for exactly this.
                     WHERE status = 'pending'
+                       OR (status = 'running' AND updated_at < NOW() - %s::interval)
                     ORDER BY created_at, id
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
              )
             RETURNING id, channel_id, cursor
-            """
+            """,
+            (STALE_LEASE,),
         )
         row = cur.fetchone()
     conn.commit()

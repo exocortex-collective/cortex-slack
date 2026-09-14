@@ -45,6 +45,17 @@ MAX_BYTES = 200 * 1024 * 1024
 TOMBSTONE_MODES = frozenset({"tombstone"})
 
 
+class FileTooLarge(RuntimeError):
+    """The file exceeds the size ceiling.
+
+    Deliberately not a ValueError, for the same reason CredentialsRejected is
+    not a PermissionError: the broad transient-failure clause catches ValueError,
+    so raising one here classified a permanent condition as retryable and a
+    single oversized file would sit at the head of the queue forever, blocking
+    every file behind it.
+    """
+
+
 class CredentialsRejected(RuntimeError):
     """Slack served a sign-in page instead of the file.
 
@@ -171,7 +182,7 @@ def download(url: str, xoxc: str, xoxd: str, timeout: int = 120) -> bytes:
         data: bytes = response.read(MAX_BYTES + 1)
 
     if len(data) > MAX_BYTES:
-        raise ValueError(f"file exceeds {MAX_BYTES} bytes")
+        raise FileTooLarge(f"file exceeds {MAX_BYTES} bytes")
     if content_type.startswith("text/html"):
         # The sign-in page. Storing it would look like success forever.
         raise CredentialsRejected("got an HTML page, not the file")
@@ -184,8 +195,16 @@ def store_pending(
     xoxc: str,
     xoxd: str,
     limit: int = BATCH_SIZE,
-) -> tuple[int, int]:
-    """Download and store pending files. Returns (stored, failed)."""
+) -> tuple[int, int, int]:
+    """Download and store pending files.
+
+    Returns (stored, failed, selected). `selected` is how many rows the work
+    query returned, and it is the ONLY safe termination signal: stored and
+    failed are both zero for a batch that was entirely unfetchable, so treating
+    (0, 0) as "nothing left to do" ends the run while thousands of files are
+    still pending. That is not a hypothetical -- it happened on the first real
+    run, which logged "all files stored" with 3,203 outstanding.
+    """
     with conn.cursor() as cur:
         cur.execute(_PENDING, (limit,))
         rows = cur.fetchall()
@@ -209,6 +228,9 @@ def store_pending(
             failed += 1
             logger.warning("file download failed", file_id=file_id, error=str(exc))
             continue
+        except FileTooLarge as exc:
+            _mark_unfetchable(conn, file_id, str(exc))
+            continue
         except CredentialsRejected as exc:
             # MUST precede the broad handler. This was a PermissionError, which
             # is an OSError subclass, so the clause below caught it first and the
@@ -231,7 +253,7 @@ def store_pending(
             )
         conn.commit()
         stored += 1
-    return stored, failed
+    return stored, failed, len(rows)
 
 
 def _mark_unfetchable(conn: psycopg2.extensions.connection, file_id: str, why: str) -> None:
@@ -273,13 +295,19 @@ def main() -> int:
 
     total = 0
     while not stop["requested"]:
-        stored, failed = store_pending(conn, s3, xoxc, xoxd)
-        if stored == 0 and failed == 0:
+        stored, failed, selected = store_pending(conn, s3, xoxc, xoxd)
+        if selected == 0:
+            # The work query found nothing. This is the only condition that
+            # means finished -- see store_pending's docstring.
             logger.info("all files stored", total=total)
             return 0
         total += stored
-        logger.info("stored", batch=stored, failed=failed, total=total)
+        logger.info(
+            "stored", batch=stored, failed=failed, skipped=selected - stored - failed, total=total
+        )
         time.sleep(1)
+
+    logger.info("stopping", total=total)
     return 0
 
 

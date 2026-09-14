@@ -91,7 +91,7 @@ def test_a_stored_file_is_recorded_with_its_key(
     monkeypatch.setattr(media_worker, "download", lambda *a, **k: b"PNGDATA")
     s3 = _FakeS3()
 
-    stored, failed = store_pending(clean, s3, "xoxc", "xoxd")
+    stored, failed, _selected = store_pending(clean, s3, "xoxc", "xoxd")
 
     assert (stored, failed) == (1, 0)
     assert list(s3.objects.values()) == [b"PNGDATA"]
@@ -144,7 +144,7 @@ def test_a_transient_failure_leaves_the_file_pending(
 
     monkeypatch.setattr(media_worker, "download", _boom)
 
-    stored, failed = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+    stored, failed, _selected = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
 
     assert (stored, failed) == (0, 1)
     assert _pending(clean) == 1, "a retryable failure must stay retryable"
@@ -161,7 +161,7 @@ def test_a_tombstoned_file_is_never_fetched(
         media_worker, "download", lambda *a, **k: pytest.fail("fetched a tombstone")
     )
 
-    stored, failed = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+    stored, failed, _selected = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
 
     assert (stored, failed) == (0, 0)
 
@@ -200,7 +200,7 @@ def test_a_permanently_dead_file_stops_being_pending(
         media_worker, "download", lambda *a, **k: (_ for _ in ()).throw(_http_error(code))
     )
 
-    stored, failed = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+    stored, failed, _selected = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
 
     assert (stored, failed) == (0, 0), "counted a permanent failure as retryable"
     assert _fetch_error(clean, "F1") == f"HTTP {code}"
@@ -217,7 +217,7 @@ def test_a_transient_http_failure_stays_pending(
         media_worker, "download", lambda *a, **k: (_ for _ in ()).throw(_http_error(code))
     )
 
-    stored, failed = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+    stored, failed, _selected = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
 
     assert (stored, failed) == (0, 1)
     assert _fetch_error(clean, "F1") is None
@@ -245,3 +245,61 @@ def test_marking_a_file_unfetchable_does_not_rewrite_what_slack_said(
         cur.execute("SELECT raw->>'mode' FROM slack_files WHERE file_id = 'F1'")
         row = cur.fetchone()
     assert row is not None and row[0] == "hosted", "rewrote the archived payload"
+
+
+def test_a_batch_of_only_unfetchable_files_is_not_completion(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(0 stored, 0 failed) does not mean there is no work left.
+
+    Files skipped as permanently unfetchable increment neither counter, so a
+    batch where every file is dead looks identical to an empty queue. The worker
+    treated that as completion and exited -- on the first real run it logged
+    "all files stored" with 3,203 files still pending, and the log was the
+    reassuring half of the disagreement.
+    """
+    for i in range(3):
+        _ingest_with_file(clean, f"172537920{i}.000001", _file(f"F{i}"))
+    discover_files(clean)
+    monkeypatch.setattr(
+        media_worker, "download", lambda *a, **k: (_ for _ in ()).throw(_http_error(410))
+    )
+
+    stored, failed, selected = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+
+    assert (stored, failed) == (0, 0)
+    assert selected == 3, "the only signal that work was attempted"
+
+
+def test_an_empty_queue_is_completion(clean: psycopg2.extensions.connection) -> None:
+    stored, failed, selected = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+
+    assert (stored, failed, selected) == (0, 0, 0)
+
+
+def test_an_oversized_file_is_permanent_not_transient(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A size ceiling will not be met by trying again.
+
+    It raised ValueError, which the broad transient clause catches, so one
+    oversized file would sit at the head of the fetched_at ordering forever and
+    block every file behind it.
+    """
+    _ingest_with_file(clean, "1725379200.000001", _file())
+    discover_files(clean)
+    monkeypatch.setattr(
+        media_worker,
+        "download",
+        lambda *a, **k: (_ for _ in ()).throw(media_worker.FileTooLarge("too big")),
+    )
+
+    stored, failed, selected = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+
+    assert (stored, failed, selected) == (0, 0, 1)
+    assert _pending(clean) == 0, "an oversized file stayed pending and blocks the queue"
+
+
+def test_file_too_large_is_not_a_value_error() -> None:
+    """Or the transient handler catches it and the fix does nothing."""
+    assert not issubclass(media_worker.FileTooLarge, ValueError)

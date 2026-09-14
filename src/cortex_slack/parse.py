@@ -23,6 +23,15 @@ from typing import Any
 # anything: joins, leaves, retention notices, the tombstone left by a deleted
 # message. Excluded from default reads for the same reason as automation -- they
 # are structure, not content.
+# NOT in this set, deliberately:
+#
+#   file_comment      A person commenting on a file. The `text` is Slack's
+#                     wrapper prose ("<@U1> commented on <@U2>'s file"), but the
+#                     comment itself is in raw.comment.comment and the author in
+#                     raw.comment.user -- so treating it as system hid 69 human
+#                     comments AND the parse dropped their text and author.
+#   me_message        A person talking, in the third person.
+#   thread_broadcast  A person talking, echoed to the channel.
 SYSTEM_SUBTYPES = frozenset(
     {
         "channel_join",
@@ -36,8 +45,23 @@ SYSTEM_SUBTYPES = frozenset(
         "group_leave",
         "tombstone",
         "retention_threshold",
-        "file_comment",
         "huddle_thread",
+        # Slack describing its own furniture. Low volume -- 38 rows across the
+        # archive -- but this constant is meant to be the single answer to "what
+        # counts as noise", so leaking is worse than the count suggests.
+        "pinned_item",
+        "unpinned_item",
+        "joiner_notification_for_inviter",
+        "mpdm_move",
+        "app_conversation_join",
+        "channel_posting_permissions",
+        "channel_convert_to_private",
+        "channel_convert_to_public",
+        "tabbed_canvas_updated",
+        "tabbed_canvas_updated_unread_ignore",
+        "automatic_ai_huddle_notes_enabled",
+        "sh_room_created",
+        "ekm_access_denied",
         "reminder_add",
         "bot_add",
         "bot_remove",

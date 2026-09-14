@@ -408,3 +408,136 @@ def test_thread_replies_are_counted_in_the_total(
     assert result.seen == len(
         _stored(clean, C1)
     ), f"reported {result.seen} but stored {len(_stored(clean, C1))}"
+
+
+def test_a_failed_message_does_not_discard_the_rest_of_its_page(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ingest_message does not commit, so the page is one open transaction.
+
+    conn.rollback() threw away every message ingested since the last page
+    boundary while the counters kept claiming they were stored, and the cursor
+    then committed past them. A savepoint scopes the rollback to the one message
+    the handler's comment says it is about.
+    """
+    real = backfill.ingest_message
+    calls = {"n": 0}
+
+    def _fail_the_second(*args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ValueError("bad message")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(backfill, "ingest_message", _fail_the_second)
+    seed_jobs(clean, [{"id": C1}])
+    page = [_msg("1725379200.000001"), _msg("1725379200.000002"), _msg("1725379200.000003")]
+
+    result = run_next_job(clean, _PagedClient([page]))  # type: ignore[arg-type]
+
+    assert result is not None and result.errors == 1
+    stored = _stored(clean, C1)
+    assert len(stored) == 2, f"a single bad message took its neighbours with it: {stored}"
+
+
+def test_a_page_that_errored_does_not_advance_the_cursor(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-reading a page costs requests; skipping one cannot be undone.
+
+    _release keeps the cursor but discards the in-memory error count, so a
+    resumed run would see a clean pass and advance the watermark over the gap.
+    """
+    monkeypatch.setattr(
+        backfill, "ingest_message", lambda *a, **k: (_ for _ in ()).throw(ValueError("x"))
+    )
+    seed_jobs(clean, [{"id": C1}])
+
+    run_next_job(clean, _PagedClient([[_msg("1725379200.000001")]]))  # type: ignore[arg-type]
+
+    _status, cursor, _stored_count = _job(clean, C1)
+    assert cursor is None, f"cursor advanced past a page that stored nothing: {cursor!r}"
+
+
+def test_an_abandoned_job_is_reclaimed(clean: psycopg2.extensions.connection) -> None:
+    """Only SlackAuthError and SlackError hand a job back.
+
+    Every other exit -- SIGTERM, the laptop suspending, an error on commit --
+    left it 'running', and seed_jobs skips 'running', so the channel was never
+    worked again while the run reported completion.
+    """
+    seed_jobs(clean, [{"id": C1}])
+    with clean.cursor() as cur:
+        cur.execute(
+            "UPDATE slack_backfill_jobs SET status='running', "
+            "updated_at = NOW() - INTERVAL '2 hours' WHERE channel_id = %s",
+            (C1,),
+        )
+    clean.commit()
+
+    result = run_next_job(clean, _PagedClient([[_msg("1725379200.000001")]]))  # type: ignore[arg-type]
+
+    assert result is not None, "an abandoned job was never reclaimed"
+    assert _job(clean, C1)[0] == "done"
+
+
+def test_a_live_job_is_not_stolen(clean: psycopg2.extensions.connection) -> None:
+    """The reclaim must not take work another process is actively doing."""
+    seed_jobs(clean, [{"id": C1}])
+    with clean.cursor() as cur:
+        cur.execute(
+            "UPDATE slack_backfill_jobs SET status='running', updated_at=NOW() "
+            "WHERE channel_id = %s",
+            (C1,),
+        )
+    clean.commit()
+
+    assert run_next_job(clean, _PagedClient([])) is None, "stole a job still being worked"  # type: ignore[arg-type]
+
+
+def test_an_interrupt_hands_the_job_back_immediately(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """The stale-lease reclaim is a backstop; a deliberate stop should not wait."""
+    seed_jobs(clean, [{"id": C1}])
+
+    class _Interrupting(_PagedClient):
+        def history_pages(self, *a: Any, **k: Any) -> Any:
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        run_next_job(clean, _Interrupting([]))  # type: ignore[arg-type]
+    clean.rollback()
+
+    assert _job(clean, C1)[0] == "pending"
+
+
+def test_a_thread_broadcast_is_not_counted_twice(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """conversations.history AND conversations.replies both return it.
+
+    Its ts differs from thread_ts, so the reply counter took it as a new
+    message. Measured on the real archive: exactly 4,319 broadcasts, which is
+    exactly how far the total over-reported.
+    """
+    parent = _msg("1725379200.000001", thread_ts="1725379200.000001", reply_count=2)
+    broadcast = _msg("1725379202.000001", thread_ts="1725379200.000001", subtype="thread_broadcast")
+    seed_jobs(clean, [{"id": C1}])
+    client = _PagedClient(
+        [[parent, broadcast]],
+        threads={
+            "1725379200.000001": [
+                parent,
+                _msg("1725379201.000001", thread_ts="1725379200.000001"),
+                broadcast,
+            ]
+        },
+    )
+
+    result = run_next_job(clean, client)  # type: ignore[arg-type]
+
+    assert result is not None
+    assert result.seen == len(
+        _stored(clean, C1)
+    ), f"reported {result.seen} but stored {len(_stored(clean, C1))}"
