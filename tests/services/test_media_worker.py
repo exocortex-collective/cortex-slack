@@ -338,10 +338,10 @@ def test_one_sign_in_page_does_not_stop_the_run(
     assert _fetch_error(clean, "F0") is not None and "sign-in page" in _fetch_error(clean, "F0")
 
 
-def test_a_run_of_sign_in_pages_does_stop_the_run(
+def test_a_run_of_sign_in_pages_stops_only_if_the_session_is_really_dead(
     clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A dead session fails every file, and must not be ground through."""
+    """auth.test answers the question; the run of failures only triggers asking."""
     for i in range(8):
         _ingest_with_file(clean, f"17253792{i:02d}.000001", _file(f"F{i}"))
     discover_files(clean)
@@ -352,7 +352,56 @@ def test_a_run_of_sign_in_pages_does_stop_the_run(
     )
 
     with pytest.raises(media_worker.CredentialsRejected):
-        store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+        store_pending(clean, _FakeS3(), "xoxc", "xoxd", verify_session=lambda: False)
+
+
+def test_a_run_of_sign_in_pages_continues_when_the_session_is_valid(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Files cluster by channel and age, so a run of awkward ones is ordinary.
+
+    Twice this stopped a healthy run: once after 863 successful downloads, once
+    after 2,326, with 24 individually-flagged files and a perfectly good token.
+    Inferring session health from file responses does not work; asking does.
+    """
+    for i in range(8):
+        _ingest_with_file(clean, f"17253792{i:02d}.000001", _file(f"F{i}"))
+    discover_files(clean)
+    monkeypatch.setattr(
+        media_worker,
+        "download",
+        lambda *a, **k: (_ for _ in ()).throw(media_worker.CredentialsRejected("html")),
+    )
+
+    stored, failed, selected = store_pending(
+        clean, _FakeS3(), "xoxc", "xoxd", verify_session=lambda: True
+    )
+
+    assert selected == 8, "stopped a run whose session was confirmed healthy"
+    assert stored == 0 and failed == 0
+    assert _pending(clean) == 0, "all eight should be marked, not left to retry forever"
+
+
+def test_the_session_is_only_checked_after_a_run_of_failures(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """auth.test costs a rate-limited request; one odd file must not spend it."""
+    _ingest_with_file(clean, "1725379200.000001", _file())
+    discover_files(clean)
+    monkeypatch.setattr(
+        media_worker,
+        "download",
+        lambda *a, **k: (_ for _ in ()).throw(media_worker.CredentialsRejected("html")),
+    )
+    checks = {"n": 0}
+
+    def _count() -> bool:
+        checks["n"] += 1
+        return True
+
+    store_pending(clean, _FakeS3(), "xoxc", "xoxd", verify_session=_count)
+
+    assert checks["n"] == 0, "checked the session for a single odd file"
 
 
 def test_a_success_resets_the_credential_failure_run(

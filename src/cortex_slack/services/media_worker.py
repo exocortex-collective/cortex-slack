@@ -25,6 +25,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from typing import Any
 
 import psycopg2
@@ -32,6 +33,7 @@ from cortex_utils.logging import configure_logging, get_logger
 from psycopg2.extras import Json
 
 from cortex_slack.config import apply_schema, dsn_from_env, stealth_tokens
+from cortex_slack.slack.api import SlackClient
 from cortex_slack.storage import S3Client
 
 logger = get_logger(__name__)
@@ -91,16 +93,19 @@ SELECT file_id, raw
 # else -- timeouts, 5xx, connection resets -- is transient and stays pending.
 PERMANENT_STATUSES = frozenset({401, 403, 404, 410})
 
-# How many files in a row must answer with a sign-in page before the session
-# itself is presumed dead.
+# How many files in a row must answer with a sign-in page before the session is
+# CHECKED. Not before it is presumed dead -- inferring session health from file
+# responses does not work, and two versions of this tried.
 #
-# One is not enough, which is what the first version assumed. Observed: 863
-# files downloaded cleanly and then the 864th returned HTML, stopping the whole
-# run -- a file whose url_private redirects offsite, or one in a channel whose
-# access changed, is a per-file condition and says nothing about the token. A
-# genuinely dead session fails every file, so a short run of them is the signal
-# that actually distinguishes the two.
-CREDENTIAL_FAILURES_BEFORE_STOPPING = 5
+# Observed, in order: one sign-in page stopped a run in which 863 files had just
+# succeeded; then a threshold of five stopped a run in which 2,326 had. Files are
+# ordered by discovery, so they cluster by channel and by age, and a run of
+# awkward ones is ordinary rather than diagnostic -- 24 files were individually
+# flagged across that run and the session was fine throughout.
+#
+# So this is a trigger to go and ask. auth.test answers the question directly
+# instead of guessing from a proxy.
+CREDENTIAL_FAILURES_BEFORE_CHECKING = 5
 
 
 def discover_files(conn: psycopg2.extensions.connection, limit: int = 500) -> int:
@@ -206,6 +211,7 @@ def store_pending(
     xoxc: str,
     xoxd: str,
     limit: int = BATCH_SIZE,
+    verify_session: Callable[[], bool] | None = None,
 ) -> tuple[int, int, int]:
     """Download and store pending files.
 
@@ -248,13 +254,22 @@ def store_pending(
             # an OSError subclass, so the clause below caught it first and this
             # branch was unreachable.
             consecutive_html += 1
-            if consecutive_html >= CREDENTIAL_FAILURES_BEFORE_STOPPING:
-                logger.error(
-                    "sign-in page for several files in a row; session is dead, stopping",
-                    file_id=file_id,
-                    consecutive=consecutive_html,
-                )
-                raise
+            if consecutive_html >= CREDENTIAL_FAILURES_BEFORE_CHECKING:
+                if verify_session is not None and verify_session():
+                    # The session is fine; these files are individually
+                    # unreachable. Reset so a later genuine expiry still trips.
+                    logger.info(
+                        "several sign-in pages, but the session is still valid",
+                        consecutive=consecutive_html,
+                    )
+                    consecutive_html = 0
+                else:
+                    logger.error(
+                        "sign-in pages and auth.test failed; session is dead, stopping",
+                        file_id=file_id,
+                        consecutive=consecutive_html,
+                    )
+                    raise
             _mark_unfetchable(conn, file_id, f"sign-in page: {exc}")
             continue
         except (urllib.error.URLError, OSError, ValueError) as exc:
@@ -302,6 +317,10 @@ def main() -> int:
     conn = psycopg2.connect(dsn_from_env())
     apply_schema(conn)
     xoxc, xoxd = stealth_tokens()
+    base_url = os.environ.get("SLACK_BASE_URL")
+    if not base_url:
+        raise SystemExit("SLACK_BASE_URL is not set")
+    client = SlackClient(xoxc, xoxd, base_url)
     s3 = S3Client(
         endpoint_url=os.environ.get("S3_ENDPOINT"),
         aws_access_key_id=os.environ.get("S3_ACCESS_KEY", ""),
@@ -309,12 +328,22 @@ def main() -> int:
         bucket_name=os.environ.get("S3_BUCKET", "cortex-slack-files"),
     )
 
+    def _session_is_valid() -> bool:
+        """Ask Slack directly rather than inferring from file responses."""
+        try:
+            client._post("auth.test", {})
+        except Exception:  # noqa: BLE001 - any failure here means "cannot confirm"
+            return False
+        return True
+
     found = discover_files(conn)
     logger.info("files discovered", new=found)
 
     total = 0
     while not stop["requested"]:
-        stored, failed, selected = store_pending(conn, s3, xoxc, xoxd)
+        stored, failed, selected = store_pending(
+            conn, s3, xoxc, xoxd, verify_session=_session_is_valid
+        )
         if selected == 0:
             # The work query found nothing. This is the only condition that
             # means finished -- see store_pending's docstring.
