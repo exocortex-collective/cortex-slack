@@ -68,10 +68,17 @@ _PENDING = """
 SELECT file_id, raw
   FROM slack_files
  WHERE s3_key IS NULL
+   AND fetch_error IS NULL
    AND raw->>'mode' IS DISTINCT FROM 'tombstone'
  ORDER BY fetched_at
  LIMIT %s
 """
+
+# HTTP statuses that will never succeed on a retry. 404 and 410 mean the file is
+# gone from Slack; 401 and 403 mean this session cannot have it, which for a
+# session-scoped credential is not going to change by asking again. Everything
+# else -- timeouts, 5xx, connection resets -- is transient and stays pending.
+PERMANENT_STATUSES = frozenset({401, 403, 404, 410})
 
 
 def discover_files(conn: psycopg2.extensions.connection, limit: int = 500) -> int:
@@ -189,10 +196,19 @@ def store_pending(
         if not url:
             # No URL at all: nothing to fetch, ever. Left pending would make it
             # a permanent resident of the work queue.
-            _mark_unavailable(conn, file_id, "no download url")
+            _mark_unfetchable(conn, file_id, "no download url")
             continue
         try:
             data = download(url, xoxc, xoxd)
+        except urllib.error.HTTPError as exc:
+            if exc.code in PERMANENT_STATUSES:
+                # Retrying this is spending a rate-limited request on a
+                # guaranteed failure, every pass, forever.
+                _mark_unfetchable(conn, file_id, f"HTTP {exc.code}")
+                continue
+            failed += 1
+            logger.warning("file download failed", file_id=file_id, error=str(exc))
+            continue
         except CredentialsRejected as exc:
             # MUST precede the broad handler. This was a PermissionError, which
             # is an OSError subclass, so the clause below caught it first and the
@@ -218,16 +234,18 @@ def store_pending(
     return stored, failed
 
 
-def _mark_unavailable(conn: psycopg2.extensions.connection, file_id: str, why: str) -> None:
-    """Record that this file can never be fetched, so it stops being pending."""
+def _mark_unfetchable(conn: psycopg2.extensions.connection, file_id: str, why: str) -> None:
+    """Record that this file can never be fetched, so it stops being pending.
+
+    Writes fetch_error rather than rewriting raw. raw is what Slack returned and
+    stays that way: an earlier version set raw->>'mode' to 'tombstone', which
+    both corrupted the archive and made "Slack deleted this" indistinguishable
+    from "we could not download it".
+    """
     with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE slack_files SET raw = jsonb_set(raw, '{mode}', '\"tombstone\"'), "
-            "stored_at = NOW() WHERE file_id = %s",
-            (file_id,),
-        )
+        cur.execute("UPDATE slack_files SET fetch_error = %s WHERE file_id = %s", (why, file_id))
     conn.commit()
-    logger.info("file unavailable", file_id=file_id, reason=why)
+    logger.info("file unfetchable", file_id=file_id, reason=why)
 
 
 def main() -> int:

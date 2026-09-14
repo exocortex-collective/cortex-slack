@@ -55,8 +55,14 @@ def _file(file_id: str = "F1", **extra: Any) -> dict[str, Any]:
 
 
 def _pending(conn: psycopg2.extensions.connection) -> int:
+    """Files still worth attempting: not stored, and not permanently failed.
+
+    Must match the worker's own _PENDING predicate. It did not, once: this
+    counted only `s3_key IS NULL`, so a file correctly marked unfetchable still
+    read as outstanding and the test disagreed with the code it was checking.
+    """
     with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM slack_files WHERE s3_key IS NULL")
+        cur.execute("SELECT count(*) FROM slack_files WHERE s3_key IS NULL AND fetch_error IS NULL")
         row = cur.fetchone()
         return 0 if row is None else int(row[0])
 
@@ -166,3 +172,76 @@ def test_keys_are_sharded_not_flat() -> None:
 
     assert key.startswith("slack/F0/F01ABCDEF/")
     assert "/" not in s3_key_for("F1", "a/b/c.png").rsplit("/", 1)[1]
+
+
+def _fetch_error(conn: psycopg2.extensions.connection, file_id: str) -> str | None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT fetch_error FROM slack_files WHERE file_id = %s", (file_id,))
+        row = cur.fetchone()
+        return None if row is None else row[0]
+
+
+def _http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://x", code, "nope", {}, None)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("code", [401, 403, 404, 410])
+def test_a_permanently_dead_file_stops_being_pending(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    """Retrying these spends a rate-limited request on a guaranteed failure.
+
+    Measured on the real archive: 40 of the first 800 attempts were 404 or 410,
+    and each would have been re-requested on every pass forever.
+    """
+    _ingest_with_file(clean, "1725379200.000001", _file())
+    discover_files(clean)
+    monkeypatch.setattr(
+        media_worker, "download", lambda *a, **k: (_ for _ in ()).throw(_http_error(code))
+    )
+
+    stored, failed = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+
+    assert (stored, failed) == (0, 0), "counted a permanent failure as retryable"
+    assert _fetch_error(clean, "F1") == f"HTTP {code}"
+    assert _pending(clean) == 0
+
+
+@pytest.mark.parametrize("code", [500, 502, 503])
+def test_a_transient_http_failure_stays_pending(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    _ingest_with_file(clean, "1725379200.000001", _file())
+    discover_files(clean)
+    monkeypatch.setattr(
+        media_worker, "download", lambda *a, **k: (_ for _ in ()).throw(_http_error(code))
+    )
+
+    stored, failed = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+
+    assert (stored, failed) == (0, 1)
+    assert _fetch_error(clean, "F1") is None
+    assert _pending(clean) == 1, "a retryable failure must stay retryable"
+
+
+def test_marking_a_file_unfetchable_does_not_rewrite_what_slack_said(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """raw is the record of the API response and must stay that way.
+
+    An earlier version set raw->>'mode' to 'tombstone', which corrupted the
+    archive and made "Slack deleted this" indistinguishable from "we could not
+    download it".
+    """
+    _ingest_with_file(clean, "1725379200.000001", _file(mode="hosted"))
+    discover_files(clean)
+    monkeypatch.setattr(
+        media_worker, "download", lambda *a, **k: (_ for _ in ()).throw(_http_error(410))
+    )
+
+    store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+
+    with clean.cursor() as cur:
+        cur.execute("SELECT raw->>'mode' FROM slack_files WHERE file_id = 'F1'")
+        row = cur.fetchone()
+    assert row is not None and row[0] == "hosted", "rewrote the archived payload"
