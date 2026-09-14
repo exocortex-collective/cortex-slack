@@ -76,3 +76,22 @@ def test_parsing_is_idempotent(clean: psycopg2.extensions.connection) -> None:
     written, _ = parse_batch(clean, after=START)
 
     assert written == 0, "re-parsed a message that was already current"
+
+
+def test_an_empty_batch_does_not_leave_a_transaction_open(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """Idling with a transaction open blocks every future ALTER TABLE.
+
+    psycopg2 opens one on the first statement, so a SELECT that finds nothing
+    still leaves the connection holding ACCESS SHARE. A sibling worker's
+    apply_schema() then waits on an AccessExclusiveLock that is never granted --
+    observed in production, with the media worker wedged for 75 seconds before
+    anyone noticed it was a lock and not slow I/O.
+    """
+    written, next_key = parse_batch(clean)
+
+    assert (written, next_key) == (0, None)
+    assert (
+        clean.status == psycopg2.extensions.STATUS_READY
+    ), "left a transaction open after finding no work"
