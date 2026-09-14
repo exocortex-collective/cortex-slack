@@ -139,14 +139,22 @@ def clean(schema: psycopg2.extensions.connection) -> psycopg2.extensions.connect
     would delete their work.
     """
     with schema.cursor() as cur:
-        # Every table this service owns, not only the one the derived rows
-        # cascade from: slack_backfill_jobs and slack_sync_state are written
-        # directly, so leaving them would leak a previous test's jobs and
-        # watermarks into the next one -- and the failure lands on the innocent
-        # test, which is how this cost an afternoon the first time.
-        cur.execute("TRUNCATE slack_messages_raw CASCADE")
-        cur.execute("TRUNCATE slack_backfill_jobs")
-        cur.execute("TRUNCATE slack_sync_state")
+        # Discovered, not hand-listed. Naming the tables individually has now
+        # leaked state between tests twice -- first slack_backfill_jobs and
+        # slack_sync_state, then slack_files -- and each time the failure landed
+        # on an innocent test with a symptom unrelated to the cause. A list that
+        # has to be maintained in step with the schema will be forgotten again.
+        cur.execute(
+            """
+            SELECT tablename FROM pg_tables
+             WHERE schemaname = 'public' AND tablename LIKE 'slack\\_%'
+            """
+        )
+        tables = [row[0] for row in cur.fetchall()]
+        assert tables, "found no slack tables to clean: the schema did not apply"
+        cur.execute(f"TRUNCATE {', '.join(tables)} CASCADE")
+        # The queue is shared with the rest of Cortex, so it is filtered rather
+        # than truncated: other services' work lives there.
         cur.execute("DELETE FROM queue WHERE queue_name = 'slack_parse'")
     schema.commit()
     return schema
