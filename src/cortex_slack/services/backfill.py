@@ -42,11 +42,20 @@ class ChannelResult:
     updated: int = 0
     unchanged: int = 0
     threads: int = 0
+    replies: int = 0
     errors: int = 0
 
     @property
     def seen(self) -> int:
-        return self.stored + self.updated + self.unchanged
+        """Every message this walk ingested, replies included.
+
+        Replies were originally left out, so the run log undercounted: a
+        completed backfill reported 1,513,696 against 1,545,184 rows actually
+        stored. An operator reconciling the two has no way to tell a counting
+        gap from 31,488 lost messages, which is the whole reason the number is
+        printed.
+        """
+        return self.stored + self.updated + self.unchanged + self.replies
 
     @property
     def clean(self) -> bool:
@@ -137,6 +146,7 @@ def run_next_job(conn: psycopg2.extensions.connection, client: SlackClient) -> C
         seen=result.seen,
         stored=result.stored,
         threads=result.threads,
+        replies=result.replies,
         errors=result.errors,
     )
     return result
@@ -149,7 +159,7 @@ def _walk_channel(
     channel_id: str,
     cursor: str | None,
 ) -> ChannelResult:
-    stored = updated = unchanged = threads = errors = 0
+    stored = updated = unchanged = threads = replies = errors = 0
 
     for messages, next_cursor in client.history_pages(channel_id, cursor=cursor):
         for message in messages:
@@ -180,7 +190,9 @@ def _walk_channel(
 
             if _has_thread(message):
                 threads += 1
-                errors += _walk_thread(conn, client, channel_id, str(message["ts"]))
+                ingested, failed = _walk_thread(conn, client, channel_id, str(message["ts"]))
+                replies += ingested
+                errors += failed
 
         # The page's messages and the cursor that moves past it commit together.
         # Storing the cursor first would skip this page's messages after a crash;
@@ -189,23 +201,29 @@ def _walk_channel(
         _record_progress(conn, job_id, stored, next_cursor)
         conn.commit()
 
-    return ChannelResult(channel_id, stored, updated, unchanged, threads, errors)
+    return ChannelResult(channel_id, stored, updated, unchanged, threads, replies, errors)
 
 
 def _walk_thread(
     conn: psycopg2.extensions.connection, client: SlackClient, channel_id: str, thread_ts: str
-) -> int:
-    """Ingest a thread's replies. Returns the error count.
+) -> tuple[int, int]:
+    """Ingest a thread's replies. Returns (ingested, errors).
 
     conversations.history does not return replies, so a channel scan alone
     captures only the parents -- and a Slack conversation's meaning usually
     lives in the thread rather than the message that started it. The parent
     comes back here too and re-ingests as UNCHANGED, so it is not filtered.
     """
-    errors = 0
+    ingested = errors = 0
     for reply in client.replies(channel_id, thread_ts):
         try:
             ingest_message(conn, channel_id, reply, source=SOURCE, enqueue_parse=ENQUEUE_PARSE)
+            # The parent comes back in this response and was already counted by
+            # the history walk that got us here. Counting it again turns the
+            # undercount this fix was for into an overcount, which is no more
+            # reconcilable against the row count than the original was.
+            if reply.get("ts") != thread_ts:
+                ingested += 1
         except Exception as exc:  # noqa: BLE001
             errors += 1
             logger.warning(
@@ -216,7 +234,7 @@ def _walk_thread(
                 error=str(exc),
             )
             conn.rollback()
-    return errors
+    return ingested, errors
 
 
 def _has_thread(message: dict[str, Any]) -> bool:

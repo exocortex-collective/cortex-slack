@@ -377,3 +377,34 @@ def test_a_failed_conversation_is_retried_on_the_next_run(
     monkeypatch.undo()
 
     assert seed_jobs(clean, [{"id": C1}]) == 1, "a failed conversation was never retried"
+
+
+def test_thread_replies_are_counted_in_the_total(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """The reported count must reconcile with the rows actually stored.
+
+    Replies were ingested but not counted, so a completed backfill reported
+    1,513,696 against 1,545,184 rows in the table. An operator reconciling those
+    cannot tell a counting gap from 31,488 lost messages -- which is the only
+    reason the number is printed at all.
+    """
+    parent = _msg("1725379200.000001", thread_ts="1725379200.000001", reply_count=2)
+    seed_jobs(clean, [{"id": C1}])
+    client = _PagedClient(
+        [[parent]],
+        threads={
+            "1725379200.000001": [
+                parent,
+                _msg("1725379201.000001", thread_ts="1725379200.000001"),
+                _msg("1725379202.000001", thread_ts="1725379200.000001"),
+            ]
+        },
+    )
+
+    result = run_next_job(clean, client)  # type: ignore[arg-type]
+
+    assert result is not None
+    assert result.seen == len(
+        _stored(clean, C1)
+    ), f"reported {result.seen} but stored {len(_stored(clean, C1))}"
