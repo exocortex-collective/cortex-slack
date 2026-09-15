@@ -442,8 +442,16 @@ def test_a_permanently_failing_file_is_eventually_given_up_on(
         lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError("reset")),
     )
 
-    for _ in range(media_worker.MAX_ATTEMPTS):
+    # Each attempt schedules the next one into the future, so the work query
+    # correctly refuses to return the row until it is due. Clearing it is what
+    # a later pass would see.
+    from cortex_slack.retry import MAX_ATTEMPTS
+
+    for _ in range(MAX_ATTEMPTS):
         store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+        with clean.cursor() as cur:
+            cur.execute("UPDATE slack_files SET next_attempt_at = NULL")
+        clean.commit()
 
     assert _pending(clean) == 0, "retried past its budget"
     error = _fetch_error(clean, "F1")
@@ -494,7 +502,43 @@ def test_other_client_errors_are_permanent_too(
     assert _fetch_error(clean, "F1") == f"HTTP {code}"
 
 
-def test_rate_limiting_is_not_treated_as_permanent() -> None:
-    """429 is the one 4xx that a retry fixes."""
-    assert 429 not in media_worker.PERMANENT_STATUSES
-    assert 400 in media_worker.PERMANENT_STATUSES
+def test_a_transient_failure_is_not_retried_immediately(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Five attempts fired inside one outage is not a retry policy.
+
+    Every one of them samples the same broken moment, and the file is then
+    given up on for a cause that has already passed.
+    """
+    _ingest_with_file(clean, "1725379200.000001", _file())
+    discover_files(clean)
+    monkeypatch.setattr(
+        media_worker,
+        "download",
+        lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError("reset")),
+    )
+
+    first = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+    second = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+
+    assert first[1] == 1, "the first attempt should have been made"
+    assert second[2] == 0, "retried immediately instead of waiting out the backoff"
+
+
+def test_a_terminal_failure_is_not_given_a_backoff(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 404 will not be fixed by waiting, so it must not occupy the budget."""
+    _ingest_with_file(clean, "1725379200.000001", _file())
+    discover_files(clean)
+    monkeypatch.setattr(
+        media_worker, "download", lambda *a, **k: (_ for _ in ()).throw(_http_error(404))
+    )
+
+    store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+
+    assert _fetch_error(clean, "F1") == "HTTP 404"
+    with clean.cursor() as cur:
+        cur.execute("SELECT attempts FROM slack_files WHERE file_id = 'F1'")
+        row = cur.fetchone()
+    assert row is not None and row[0] == 0, "spent a retry on something terminal"

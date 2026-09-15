@@ -33,6 +33,7 @@ from cortex_utils.logging import configure_logging, get_logger
 from psycopg2.extras import Json
 
 from cortex_slack.config import apply_schema, dsn_from_env, stealth_tokens
+from cortex_slack.retry import classify, next_attempt_at
 from cortex_slack.slack.api import SlackClient
 from cortex_slack.storage import S3Client
 
@@ -83,10 +84,14 @@ SELECT file_id, raw, attempts
  WHERE s3_key IS NULL
    AND fetch_error IS NULL
    AND raw->>'mode' IS DISTINCT FROM 'tombstone'
+   -- Not yet due is not the same as not pending. Without this a file that just
+   -- failed comes straight back, which is how five retries were spent inside
+   -- one outage.
+   AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
  -- Untried files first. Ordering by fetched_at alone let a handful of
  -- persistently failing files sit at the head of the queue and starve
  -- everything behind them.
- ORDER BY last_attempt_at NULLS FIRST, fetched_at
+ ORDER BY next_attempt_at NULLS FIRST, fetched_at
  LIMIT %s
 """
 
@@ -94,15 +99,8 @@ SELECT file_id, raw, attempts
 # gone from Slack; 401 and 403 mean this session cannot have it, which for a
 # session-scoped credential is not going to change by asking again. Everything
 # else -- timeouts, 5xx, connection resets -- is transient and stays pending.
-# Client-error statuses that will never succeed on a retry. Any 4xx except 429
-# qualifies: the request itself is the problem, and repeating it unchanged
-# cannot fix that. 400 was the omission that mattered -- 16 files answering it
-# accumulated 867 attempts before this was noticed.
-PERMANENT_STATUSES = frozenset(range(400, 429)) | frozenset(range(430, 500))
-
-# How many times a transient failure is retried before the file is given up on.
-# "Retryable" without a bound is not a retry policy, it is a loop.
-MAX_ATTEMPTS = 5
+# Whether a failure is terminal or transient, and when a transient one may be
+# tried again, both live in cortex_slack.retry -- see classify().
 
 # How long to wait when caught up before looking for new work, and how often to
 # re-scan the archive for newly-arrived files.
@@ -260,16 +258,8 @@ def store_pending(
             continue
         try:
             data = download(url, xoxc, xoxd)
-        except urllib.error.HTTPError as exc:
-            if exc.code in PERMANENT_STATUSES:
-                # Retrying this is spending a rate-limited request on a
-                # guaranteed failure, every pass, forever.
-                _mark_unfetchable(conn, file_id, f"HTTP {exc.code}")
-                continue
-            failed += 1
-            logger.warning("file download failed", file_id=file_id, error=str(exc))
-            continue
         except FileTooLarge as exc:
+            # Terminal by construction: the ceiling will not be met by waiting.
             _mark_unfetchable(conn, file_id, str(exc))
             continue
         except CredentialsRejected as exc:
@@ -295,15 +285,13 @@ def store_pending(
                     raise
             _mark_unfetchable(conn, file_id, f"sign-in page: {exc}")
             continue
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001 - classify() decides what it means
+            decision = classify(exc)
+            if decision.terminal:
+                _mark_unfetchable(conn, file_id, decision.reason)
+                continue
             failed += 1
-            _record_attempt(conn, file_id, attempts + 1, str(exc))
-            logger.warning(
-                "file download failed",
-                file_id=file_id,
-                attempt=attempts + 1,
-                error=str(exc),
-            )
+            _record_attempt(conn, file_id, attempts + 1, decision.reason)
             continue
 
         consecutive_html = 0
@@ -322,21 +310,25 @@ def store_pending(
 def _record_attempt(
     conn: psycopg2.extensions.connection, file_id: str, attempts: int, why: str
 ) -> None:
-    """Count a transient failure, and give up once the budget is spent.
-
-    Touching last_attempt_at is what moves the row out of the head of the work
-    queue, so a failing file stops blocking the ones behind it even before its
-    attempts run out.
-    """
-    if attempts >= MAX_ATTEMPTS:
+    """Schedule a transient failure's next try, or give up once out of budget."""
+    due = next_attempt_at(attempts)
+    if due is None:
         _mark_unfetchable(conn, file_id, f"failed {attempts} times, last: {why[:200]}")
         return
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE slack_files SET attempts = %s, last_attempt_at = NOW() WHERE file_id = %s",
-            (attempts, file_id),
+            "UPDATE slack_files SET attempts = %s, last_attempt_at = NOW(), "
+            "next_attempt_at = %s WHERE file_id = %s",
+            (attempts, due, file_id),
         )
     conn.commit()
+    logger.warning(
+        "file download failed; will retry",
+        file_id=file_id,
+        attempt=attempts,
+        error=why,
+        next_attempt_at=due.isoformat(),
+    )
 
 
 def _mark_unfetchable(conn: psycopg2.extensions.connection, file_id: str, why: str) -> None:
