@@ -314,7 +314,11 @@ def _finish(
                 SELECT %s, MAX(ts), NOW(), NULL
                   FROM slack_messages_raw WHERE channel_id = %s
                 ON CONFLICT (channel_id) DO UPDATE
-                   SET last_ts = EXCLUDED.last_ts,
+                   -- Never backwards, and NULL-safe: EXCLUDED.last_ts is MAX(ts)
+                   -- over the channel's raw rows, which is NULL when a re-scan
+                   -- finds none. Plain assignment nulled an existing watermark
+                   -- in that case; the poller's _advance already guards this.
+                   SET last_ts = GREATEST(slack_sync_state.last_ts, EXCLUDED.last_ts),
                        last_synced_at = EXCLUDED.last_synced_at,
                        last_error = NULL,
                        updated_at = NOW()

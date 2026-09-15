@@ -13,7 +13,7 @@ import pytest
 
 from cortex_slack.services import backfill
 from cortex_slack.services.backfill import run_next_job, seed_jobs
-from cortex_slack.slack.api import SlackAuthError, SlackError
+from cortex_slack.slack.api import SlackAuthError, SlackError, validate_ts
 
 C1 = "C0AAAAAAA"
 C2 = "C0BBBBBBB"
@@ -52,6 +52,12 @@ class _PagedClient:
         latest: str | None = None,
         cursor: str | None = None,
     ) -> Any:
+        # The client's own predicate, so a fake laxer than the API cannot pass
+        # a test over a request Slack would reject.
+        if oldest is not None:
+            validate_ts(oldest, field="oldest")
+        if latest is not None:
+            validate_ts(latest, field="latest")
         index = 0 if cursor is None else int(cursor)
         while index < len(self._pages):
             self.requested_cursors.append(cursor)
@@ -64,6 +70,7 @@ class _PagedClient:
             cursor = next_cursor
 
     def replies(self, channel: str, thread_ts: str) -> list[dict[str, Any]]:
+        validate_ts(thread_ts, field="thread_ts")
         return self._threads.get(thread_ts, [])
 
 
@@ -541,3 +548,27 @@ def test_a_thread_broadcast_is_not_counted_twice(
     assert result.seen == len(_stored(clean, C1)), (
         f"reported {result.seen} but stored {len(_stored(clean, C1))}"
     )
+
+
+def test_rescanning_an_empty_channel_keeps_its_watermark(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """_finish sets last_ts from MAX(ts) over the channel's raw rows.
+
+    That is NULL when a re-scan finds nothing, and a plain assignment then
+    erased a watermark the poller was relying on. The poller's _advance guards
+    this with GREATEST; the backfill did not.
+    """
+    with clean.cursor() as cur:
+        cur.execute(
+            "INSERT INTO slack_sync_state (channel_id, last_ts) VALUES (%s, %s)",
+            (C1, "1725379200.000001"),
+        )
+    clean.commit()
+    seed_jobs(clean, [{"id": C1}])
+
+    result = run_next_job(clean, _PagedClient([[]]))  # type: ignore[arg-type]
+
+    assert result is not None and result.clean
+    assert _job(clean, C1)[0] == "done"
+    assert _watermark(clean, C1) == "1725379200.000001", "an empty re-scan nulled the watermark"

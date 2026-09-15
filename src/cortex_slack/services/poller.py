@@ -140,7 +140,12 @@ def ts_minus_seconds(ts: str, seconds: int) -> str:
     if not TS_PATTERN.match(ts):
         raise SlackError("conversations.history", f"bad watermark {ts!r}")
     whole, _, micros = ts.partition(".")
-    return f"{max(int(whole) - seconds, 0)}.{micros or '000000'}"
+    # Zero-padded to ten digits so the result is itself a ts validate_ts
+    # accepts. The clamp at zero used to yield "0.000001", which the client
+    # refuses with a ValueError -- not a SlackError, so it would have escaped
+    # poll_once's per-channel handler. The test fakes accepted it because they
+    # validated nothing; they now apply the same predicate the client does.
+    return f"{max(int(whole) - seconds, 0):010d}.{micros or '000000'}"
 
 
 def poll_once(

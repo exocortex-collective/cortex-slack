@@ -49,7 +49,7 @@ def _file(file_id: str = "F1", **extra: Any) -> dict[str, Any]:
         "name": "diagram.png",
         "mimetype": "image/png",
         "size": 1234,
-        "url_private_download": "https://files.slack.com/f/F1/diagram.png",
+        "url_private_download": f"https://files.slack.com/f/{file_id}/diagram.png",
         **extra,
     }
 
@@ -471,21 +471,37 @@ def test_a_transient_failure_moves_out_of_the_queue_head(
     _ingest_with_file(clean, "1725379200.000001", _file("FBAD"))
     _ingest_with_file(clean, "1725379200.000002", _file("FGOOD"))
     discover_files(clean)
-    monkeypatch.setattr(
-        media_worker,
-        "download",
-        lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError("reset")),
-    )
-    store_pending(clean, _FakeS3(), "xoxc", "xoxd", limit=1)
-
+    # Both rows came from one discover_files transaction and share a fetched_at.
+    # Give FBAD the strictly older one, so the ordering under test has to
+    # overcome arrival order rather than be handed it by an unspecified tie.
     with clean.cursor() as cur:
         cur.execute(
-            "SELECT file_id FROM slack_files WHERE s3_key IS NULL AND fetch_error IS NULL "
-            "ORDER BY last_attempt_at NULLS FIRST, fetched_at LIMIT 1"
+            "UPDATE slack_files SET fetched_at = fetched_at - interval '1 minute' "
+            "WHERE file_id = 'FBAD'"
         )
-        row = cur.fetchone()
+    clean.commit()
+    attempted: list[str] = []
 
-    assert row is not None and row[0] == "FGOOD", "the failing file still blocks the queue"
+    def _record_then_fail(url: str, *_a: Any, **_k: Any) -> bytes:
+        attempted.append(url.split("/")[-2])
+        raise urllib.error.URLError("reset")
+
+    monkeypatch.setattr(media_worker, "download", _record_then_fail)
+
+    store_pending(clean, _FakeS3(), "xoxc", "xoxd", limit=1)
+    assert attempted == ["FBAD"], "the older file was not tried first"
+
+    # Make FBAD due again -- but attempted, not untried. The worker's own work
+    # query, not a restatement of it, must now put the never-tried file ahead.
+    with clean.cursor() as cur:
+        cur.execute(
+            "UPDATE slack_files SET next_attempt_at = NOW() - interval '1 second' "
+            "WHERE file_id = 'FBAD'"
+        )
+    clean.commit()
+    store_pending(clean, _FakeS3(), "xoxc", "xoxd", limit=1)
+
+    assert attempted == ["FBAD", "FGOOD"], "the failing file still blocks the queue"
 
 
 @pytest.mark.parametrize("code", [400, 402, 405, 422])

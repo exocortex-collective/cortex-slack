@@ -14,7 +14,7 @@ import pytest
 
 from cortex_slack.services import poller
 from cortex_slack.services.poller import poll_once, ts_minus_seconds
-from cortex_slack.slack.api import SlackAuthError, SlackError
+from cortex_slack.slack.api import SlackAuthError, SlackError, validate_ts
 
 C1 = "C0AAAAAAA"
 
@@ -24,7 +24,13 @@ def _msg(ts: str, **extra: Any) -> dict[str, Any]:
 
 
 class _Client:
-    """Records the oldest it was asked for, which is the watermark under test."""
+    """Records the oldest it was asked for, which is the watermark under test.
+
+    Validates every ts with the client's own predicate. cortex-granola's
+    incremental sync never worked in production because its fake accepted any
+    string where the API wanted one format; a fake laxer than the API is a test
+    that passes over a feature that does not exist.
+    """
 
     def __init__(
         self, messages: list[dict[str, Any]] | None = None, error: Exception | None = None
@@ -37,6 +43,10 @@ class _Client:
         self, channel: str, *, oldest: str | None = None, latest: str | None = None
     ) -> list[dict[str, Any]]:
         self.oldest_seen.append(oldest)
+        if oldest is not None:
+            validate_ts(oldest, field="oldest")
+        if latest is not None:
+            validate_ts(latest, field="latest")
         if self._error is not None:
             raise self._error
         return [m for m in self._messages if oldest is None or m["ts"] > oldest]
@@ -197,7 +207,15 @@ def test_the_overlap_preserves_the_sub_second_half() -> None:
 
 
 def test_the_overlap_cannot_go_negative() -> None:
-    assert ts_minus_seconds("0000000100.000001", 300) == "0.000001"
+    """And the clamped value must still be a ts the client will send.
+
+    "0.000001" is what this used to produce, and validate_ts refuses it with a
+    ValueError -- which is not a SlackError and would have escaped poll_once.
+    """
+    oldest = ts_minus_seconds("0000000100.000001", 300)
+
+    assert oldest == "0000000000.000001"
+    assert validate_ts(oldest, field="oldest") == oldest
 
 
 # -- thread sweeping -------------------------------------------------------
@@ -224,12 +242,18 @@ def _parent(conn: psycopg2.extensions.connection, ts: str, replies: int, channel
 
 
 class _ThreadClient(_Client):
-    def __init__(self, replies: dict[str, list[dict[str, Any]]] | None = None) -> None:
-        super().__init__([])
+    def __init__(
+        self,
+        replies: dict[str, list[dict[str, Any]]] | None = None,
+        *,
+        messages: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(messages or [])
         self._replies = replies or {}
         self.walked: list[str] = []
 
     def replies(self, channel: str, thread_ts: str) -> list[dict[str, Any]]:
+        validate_ts(thread_ts, field="thread_ts")
         self.walked.append(thread_ts)
         return self._replies.get(thread_ts, [])
 
@@ -400,3 +424,43 @@ def test_the_sweep_watermark_does_not_advance_on_a_failed_walk(
         cur.execute("SELECT thread_swept_at FROM slack_messages_raw WHERE ts = %s", (old,))
         row = cur.fetchone()
     assert row is not None and row[0] is None, "marked a failed sweep as done"
+
+
+def test_one_failed_reply_does_not_take_the_thread_or_the_watermark_with_it(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """walk_thread's error count is the only thing holding the watermark for replies.
+
+    Both adapters fold it into the counter that gates the watermark, and both
+    suites tested that gate only for messages arriving through history(). A
+    regression that swallowed a reply failure, or rolled back the transaction
+    instead of the savepoint, would advance the watermark past unstored replies
+    with the suite still green. This is the negative case.
+    """
+    _channel(clean)
+    parent = "1725379200.000001"
+    replies = [_msg(f"172537920{i}.000001", thread_ts=parent) for i in (1, 2, 3)]
+    from cortex_slack import threads
+
+    real_ingest = threads.ingest_message
+
+    def _fail_the_second(conn: Any, channel_id: str, message: dict[str, Any], **kw: Any) -> Any:
+        if message["ts"] == replies[1]["ts"]:
+            raise ValueError("simulated ingest failure")
+        return real_ingest(conn, channel_id, message, **kw)
+
+    monkeypatch.setattr(threads, "ingest_message", _fail_the_second)
+    client = _ThreadClient(
+        {parent: replies}, messages=[_msg(parent, thread_ts=parent, reply_count=3)]
+    )
+
+    stats = poll_once(clean, client)  # type: ignore[arg-type]
+
+    assert stats.errors >= 1, "a failed reply was swallowed"
+    with clean.cursor() as cur:
+        cur.execute("SELECT ts FROM slack_messages_raw ORDER BY ts")
+        stored = [r[0] for r in cur.fetchall()]
+    assert stored == [parent, replies[0]["ts"], replies[2]["ts"]], (
+        "the savepoint did not isolate the failure: neighbouring replies were lost"
+    )
+    assert _watermark(clean) is None, "watermark advanced past an unstored reply"

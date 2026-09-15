@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
 from importlib import resources
 
 import psycopg2
@@ -32,7 +31,7 @@ def dsn_from_env() -> str:
     """The Postgres DSN, without requiring any Slack credential.
 
     Its own function because the parse worker needs a database and no token.
-    Reaching for SlackSyncConfig.from_env() there would force a credential on a
+    Bundling the DSN with the Slack credentials would force a credential on a
     service that never calls Slack, and compose would then mount the secret into
     a container with no use for it.
     """
@@ -140,34 +139,3 @@ def stealth_tokens(path: str | None = None) -> tuple[str, str]:
             )
         resolved.append(value)
     return resolved[0], resolved[1]
-
-
-@dataclass(frozen=True)
-class SlackSyncConfig:
-    dsn: str
-    xoxc_token: str
-    xoxd_token: str
-    poll_interval_s: int
-    overlap_seconds: int
-    deny_channels: frozenset[str]
-
-    @classmethod
-    def from_env(cls) -> SlackSyncConfig:
-        xoxc, xoxd = stealth_tokens()
-        return cls(
-            dsn=dsn_from_env(),
-            xoxc_token=xoxc,
-            xoxd_token=xoxd,
-            poll_interval_s=int(os.environ.get("SLACK_POLL_INTERVAL_S", "300")),
-            # Re-read a little before the watermark on every poll. Slack can
-            # deliver a message whose ts is older than one already seen, and an
-            # exact-watermark read would skip it permanently.
-            overlap_seconds=int(os.environ.get("SLACK_OVERLAP_SECONDS", "300")),
-            deny_channels=_split(os.environ.get("SLACK_DENY_CHANNELS")),
-        )
-
-
-def _split(value: str | None) -> frozenset[str]:
-    if not value:
-        return frozenset()
-    return frozenset(part.strip() for part in value.split(",") if part.strip())
