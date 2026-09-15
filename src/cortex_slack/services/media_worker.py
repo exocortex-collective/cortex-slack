@@ -104,6 +104,18 @@ PERMANENT_STATUSES = frozenset(range(400, 429)) | frozenset(range(430, 500))
 # "Retryable" without a bound is not a retry policy, it is a loop.
 MAX_ATTEMPTS = 5
 
+# How long to wait when caught up before looking for new work, and how often to
+# re-scan the archive for newly-arrived files.
+#
+# Being caught up is not a reason to exit. Under `restart: unless-stopped` a
+# worker that returns when idle is restarted immediately, finds nothing, and
+# returns again -- four restarts in two minutes, each logging "all files
+# stored". That is the same fault cortex-gmail-sync had, where a recoverable
+# condition was handled by dying and letting the restart policy cope.
+IDLE_SECONDS = 60.0
+DISCOVERY_INTERVAL_SECONDS = 600.0
+STOP_POLL_SECONDS = 0.5
+
 # How many files in a row must answer with a sign-in page before the session is
 # CHECKED. Not before it is presumed dead -- inferring session health from file
 # responses does not work, and two versions of this tried.
@@ -373,27 +385,52 @@ def main() -> int:
             return False
         return True
 
-    found = discover_files(conn)
-    logger.info("files discovered", new=found)
-
     total = 0
+    last_discovery = 0.0
+
     while not stop["requested"]:
+        # Re-scan periodically: the poller keeps adding messages, and any of
+        # them may carry files. Not every cycle -- it is a scan of the whole raw
+        # archive, and there is no index for "has files".
+        if time.monotonic() - last_discovery > DISCOVERY_INTERVAL_SECONDS:
+            found = discover_files(conn)
+            last_discovery = time.monotonic()
+            if found:
+                logger.info("files discovered", new=found)
+
         stored, failed, selected = store_pending(
             conn, s3, xoxc, xoxd, verify_session=_session_is_valid
         )
         if selected == 0:
-            # The work query found nothing. This is the only condition that
-            # means finished -- see store_pending's docstring.
-            logger.info("all files stored", total=total)
-            return 0
+            # Caught up. Wait for more rather than exiting: `selected == 0` is
+            # the only honest completion signal, but completion is temporary --
+            # the poller is still running.
+            _interruptible_sleep(IDLE_SECONDS, stop)
+            continue
+
         total += stored
         logger.info(
             "stored", batch=stored, failed=failed, skipped=selected - stored - failed, total=total
         )
-        time.sleep(1)
+        _interruptible_sleep(1.0, stop)
 
     logger.info("stopping", total=total)
     return 0
+
+
+def _interruptible_sleep(seconds: float, stop: dict[str, bool]) -> None:
+    """Wait, noticing a stop request.
+
+    time.sleep() is resumed with the remaining time after a signal handler
+    returns (PEP 475), so a SIGTERM early in a sixty-second wait would otherwise
+    still wait out the rest -- against Docker's ten-second stop grace.
+    """
+    deadline = time.monotonic() + seconds
+    while not stop["requested"]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(STOP_POLL_SECONDS, remaining))
 
 
 if __name__ == "__main__":
