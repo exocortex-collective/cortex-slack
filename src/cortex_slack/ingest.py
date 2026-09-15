@@ -106,21 +106,34 @@ def ingest_message(
         raise ValueError(f"message in {channel_id} has no ts")
 
     edited_ts = _edited_ts(message)
+    # Lifted out of the payload and refreshed unconditionally. A reply changes
+    # neither ts nor edited_ts, so a count read only from `raw` froze at first
+    # capture -- and the thread sweep, which selects on it, could never see a
+    # message that gained its first reply after it left the poll's overlap
+    # window. Measured: zero parents where stored < claimed, i.e. the sweep's
+    # self-correcting arm had never once been able to fire.
+    reply_count = int(message.get("reply_count") or 0)
 
     with conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO slack_messages_raw (channel_id, ts, edited_ts, source, raw)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO slack_messages_raw
+                (channel_id, ts, edited_ts, source, raw, reply_count)
+            VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (channel_id, ts) DO UPDATE
                SET raw = EXCLUDED.raw,
                    edited_ts = EXCLUDED.edited_ts,
                    source = EXCLUDED.source,
+                   reply_count = EXCLUDED.reply_count,
                    fetched_at = NOW()
+             -- A changed reply count is a reason to rewrite the row even though
+             -- the message itself is untouched: it is the only signal that a
+             -- thread has grown, and the sweep depends on it.
              WHERE slack_messages_raw.edited_ts IS DISTINCT FROM EXCLUDED.edited_ts
+                OR slack_messages_raw.reply_count IS DISTINCT FROM EXCLUDED.reply_count
             RETURNING (xmax = 0) AS inserted
             """,
-            (channel_id, ts, edited_ts, source, Json(message)),
+            (channel_id, ts, edited_ts, source, Json(message), reply_count),
         )
         row = cur.fetchone()
 

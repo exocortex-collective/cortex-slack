@@ -302,3 +302,98 @@ def test_the_sweep_is_bounded(clean: psycopg2.extensions.connection) -> None:
     poll_once(clean, client)  # type: ignore[arg-type]
 
     assert len(client.walked) == THREAD_SWEEP_LIMIT
+
+
+def test_a_thread_started_after_the_parent_left_the_window_is_still_found(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """The case the sweep exists for, and could not previously reach.
+
+    A reply changes neither the parent's ts nor its edited_ts, so a parent
+    stored before it had any replies carried reply_count = 0 forever. The sweep
+    gated candidates on reply_count > 0, so it was structurally blind to exactly
+    this: measured on the live archive, zero parents where stored < claimed,
+    meaning the self-correcting arm had never once been able to fire.
+    """
+    _channel(clean)
+    from cortex_slack.ingest import ingest_message
+
+    old = "1789000000.000001"  # recent enough to be active, outside any overlap
+    ingest_message(
+        clean,
+        C1,
+        {"type": "message", "ts": old, "user": "U1", "text": "question"},
+        source="poll",
+        enqueue_parse=False,
+    )
+    clean.commit()
+    # Parsed, so the sweep's human-message arm can see its tags.
+    from cortex_slack.services.parse_worker import parse_batch
+
+    parse_batch(clean)
+
+    reply = _msg("1789000001.000001", thread_ts=old)
+    client = _ThreadClient({old: [reply]})
+
+    poll_once(clean, client)  # type: ignore[arg-type]
+
+    assert old in client.walked, "a thread started after capture was never swept"
+    assert "1789000001.000001" in [r for r in _stored_ts(clean)], "the reply was not stored"
+
+
+def _stored_ts(conn: psycopg2.extensions.connection) -> list[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT ts FROM slack_messages_raw ORDER BY ts")
+        return [r[0] for r in cur.fetchall()]
+
+
+def test_a_growing_thread_refreshes_its_reply_count(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """The count is the only signal a thread has grown.
+
+    ingest refused to rewrite the row unless edited_ts changed, and a reply
+    changes neither ts nor edited_ts -- so the count froze at first capture.
+    """
+    _channel(clean)
+    from cortex_slack.ingest import ingest_message
+
+    ts = "1789000000.000001"
+    base = {"type": "message", "ts": ts, "user": "U1", "text": "q", "thread_ts": ts}
+    ingest_message(clean, C1, {**base, "reply_count": 0}, source="poll", enqueue_parse=False)
+    clean.commit()
+
+    ingest_message(clean, C1, {**base, "reply_count": 3}, source="poll", enqueue_parse=False)
+    clean.commit()
+
+    with clean.cursor() as cur:
+        cur.execute("SELECT reply_count FROM slack_messages_raw WHERE ts = %s", (ts,))
+        row = cur.fetchone()
+    assert row is not None and row[0] == 3, "reply count froze at first capture"
+
+
+def test_the_sweep_watermark_does_not_advance_on_a_failed_walk(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """thread_swept_at is a watermark in everything but name.
+
+    Stamping it after a walk whose replies failed restarts the re-sweep timer
+    over an incomplete thread.
+    """
+    _channel(clean)
+    old = "1789000000.000001"
+    _parent(clean, old, replies=1)
+    from cortex_slack import threads
+
+    monkeypatch.setattr(
+        threads, "ingest_message", lambda *a, **k: (_ for _ in ()).throw(ValueError("x"))
+    )
+    client = _ThreadClient({old: [_msg("1789000001.000001", thread_ts=old)]})
+
+    stats = poll_once(clean, client)  # type: ignore[arg-type]
+
+    assert stats.errors >= 1
+    with clean.cursor() as cur:
+        cur.execute("SELECT thread_swept_at FROM slack_messages_raw WHERE ts = %s", (old,))
+        row = cur.fetchone()
+    assert row is not None and row[0] is None, "marked a failed sweep as done"

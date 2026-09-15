@@ -66,10 +66,16 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+# Applied automatically by conftest's pytest_collection_modifyitems, from the
+# fixtures a test requests. Declared here so --strict-markers and the CI guard
+# both recognise it.
+markers = ["live: needs a real Postgres from CORTEX_TEST_DSN"]
 
 [tool.coverage.run]
 source = ["src/cortex_slack"]
 
 [tool.vulture]
-paths = ["src", "vulture_whitelist.py"]
+# No whitelist file: there is nothing to whitelist yet, and naming one that does
+# not exist made the CI step exit 1 on every run since this branch landed.
+paths = ["src"]
 min_confidence = 80

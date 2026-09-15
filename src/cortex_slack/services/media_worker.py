@@ -423,7 +423,7 @@ def main() -> int:
     configure_logging("slack-media-worker", os.environ.get("LOG_LEVEL", "INFO"))
     stop = {"requested": False}
 
-    def _request_stop(signum: int, _frame: Any) -> None:
+    def _request_stop(_signum: int, _frame: Any) -> None:
         stop["requested"] = True
 
     for sig in (signal.SIGTERM, signal.SIGINT):

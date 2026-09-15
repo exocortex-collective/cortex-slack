@@ -158,3 +158,26 @@ def clean(schema: psycopg2.extensions.connection) -> psycopg2.extensions.connect
         cur.execute("DELETE FROM queue WHERE queue_name = 'slack_parse'")
     schema.commit()
     return schema
+
+
+# Fixtures that require a live Postgres. A test asking for any of them cannot
+# run without CORTEX_TEST_DSN.
+_LIVE_FIXTURES = frozenset({"conn", "schema", "clean", "dsn"})
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Mark live tests by what they use, not by hand.
+
+    The CI guard selects `-m live` to prove the live tests were not silently
+    skipped. Hand-applied markers made that guard vacuous: no test carried one,
+    so the step deselected all 145 and CORTEX_REQUIRE_LIVE was never observed by
+    a single fixture -- a guard against silent skipping that silently skipped,
+    for the second time in this codebase and by a different mechanism than the
+    one its own comment describes.
+
+    Deriving the marker from the fixture list means a test written next week is
+    covered the day it is written.
+    """
+    for item in items:
+        if _LIVE_FIXTURES & set(getattr(item, "fixturenames", ())):
+            item.add_marker(pytest.mark.live)

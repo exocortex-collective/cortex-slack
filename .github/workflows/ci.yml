@@ -63,7 +63,7 @@ jobs:
         run: uv run bandit -r src -c pyproject.toml
 
       - name: Dead code
-        run: uv run vulture src vulture_whitelist.py --min-confidence 80
+        run: uv run vulture src --min-confidence 80
 
       - name: Run tests
         env:

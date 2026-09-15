@@ -65,16 +65,38 @@ THREAD_SWEEP_LIMIT = 40
 _STALE_THREADS = """
 SELECT p.channel_id, p.ts
   FROM slack_messages_raw p
- WHERE (p.raw->>'reply_count')::int > 0
-   AND (
-         (SELECT count(*) FROM slack_messages_raw r
-           WHERE r.channel_id = p.channel_id
-             AND r.raw->>'thread_ts' = p.ts
-             AND r.ts <> p.ts) < (p.raw->>'reply_count')::int
-      OR (
-           to_timestamp(split_part(p.ts, '.', 1)::bigint) > NOW() - %s::interval
-           AND (p.thread_swept_at IS NULL OR p.thread_swept_at < NOW() - %s::interval)
-         )
+  -- LEFT JOIN: an unparsed parent must still be sweepable. An inner join made
+  -- the sweep depend on the parse worker having caught up, which is a different
+  -- service's latency.
+  LEFT JOIN slack_messages m ON m.channel_id = p.channel_id AND m.ts = p.ts
+ WHERE (
+         -- Provably incomplete, at ANY age. Slack said there were more replies
+         -- than we hold, so re-walking is certain to be worth a request. No
+         -- recency gate: a thread short by ten replies is short whether it
+         -- started today or in 2019.
+         (p.reply_count > 0
+          AND (SELECT count(*) FROM slack_messages_raw r
+                WHERE r.channel_id = p.channel_id
+                  AND r.raw->>'thread_ts' = p.ts
+                  AND r.ts <> p.ts) < p.reply_count)
+       OR
+         -- Or recent enough to still attract a first reply, and due a re-check.
+         --
+         -- NOT gated on reply_count. A message stored before it had any replies
+         -- carries zero, and the count only refreshes when the message is
+         -- re-read -- which, outside the poll's overlap window, never happens.
+         -- Gating on it made the sweep structurally blind to exactly the case
+         -- it exists for.
+         --
+         -- Human messages only, to keep the pool affordable: 23,626 messages in
+         -- the last seven days, of which 600 are human. A reply to a bot message
+         -- is still reached once that message is re-read inside the overlap and
+         -- its count refreshes.
+         (to_timestamp(split_part(p.ts, '.', 1)::bigint) > NOW() - %s::interval
+          AND (p.thread_swept_at IS NULL OR p.thread_swept_at < NOW() - %s::interval)
+          AND (p.reply_count > 0
+               OR m.tags IS NULL
+               OR NOT (m.tags && ARRAY['automated', 'system'])))
        )
  ORDER BY p.thread_swept_at NULLS FIRST, p.ts DESC
  LIMIT %s
@@ -85,6 +107,12 @@ SELECT p.channel_id, p.ts
 class PollStats:
     channels: int = 0
     swept_threads: int = 0
+    # Replies are their own field, not folded into `stored`. walk_thread counts
+    # every reply it walks whatever the outcome, and the sweep re-walks each
+    # active thread every six hours -- so adding them to `stored` reported the
+    # archive growing on every pass with nothing written. The backfill already
+    # keeps them separate for exactly this reason.
+    replies: int = 0
     stored: int = 0
     updated: int = 0
     unchanged: int = 0
@@ -180,15 +208,20 @@ def sweep_threads(
             conn.rollback()
             continue
 
-        stats.stored += ingested
+        stats.replies += ingested
         stats.errors += failed
         stats.swept_threads += 1
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE slack_messages_raw SET thread_swept_at = NOW() "
-                "WHERE channel_id = %s AND ts = %s",
-                (channel_id, thread_ts),
-            )
+        if failed == 0:
+            # thread_swept_at is a watermark in everything but name: it decides
+            # which window the next pass scans. Stamping it after a walk whose
+            # replies did not all land restarts the six-hour timer over an
+            # incomplete thread.
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE slack_messages_raw SET thread_swept_at = NOW() "
+                    "WHERE channel_id = %s AND ts = %s",
+                    (channel_id, thread_ts),
+                )
         conn.commit()
 
 
@@ -241,7 +274,7 @@ def _poll_channel(
             ingested, failed = walk_thread(
                 conn, client, channel_id, str(message["ts"]), source=SOURCE
             )
-            stats.stored += ingested
+            stats.replies += ingested
             channel_errors += failed
 
         if isinstance(ts, str) and (newest_seen is None or ts > newest_seen):

@@ -40,7 +40,7 @@ def main() -> int:
     configure_logging("slack-sync", os.environ.get("LOG_LEVEL", "INFO"))
     stop = {"requested": False}
 
-    def _request_stop(signum: int, _frame: Any) -> None:
+    def _request_stop(_signum: int, _frame: Any) -> None:
         # One lock-free store and nothing else. A handler runs on the main
         # thread, so anything here that takes a lock the main thread may already
         # hold deadlocks the process against itself.
@@ -96,6 +96,8 @@ def main() -> int:
             "poll finished",
             channels=stats.channels,
             stored=stats.stored,
+            replies=stats.replies,
+            swept_threads=stats.swept_threads,
             updated=stats.updated,
             unchanged=stats.unchanged,
             errors=stats.errors,
