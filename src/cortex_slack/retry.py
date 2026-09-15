@@ -16,7 +16,7 @@ import http.client
 import random
 import urllib.error
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from enum import StrEnum
 
 # Rate limiting is the one 4xx a retry fixes; every other client error says the
@@ -46,7 +46,7 @@ JITTER = 0.25
 class Disposition(StrEnum):
     TERMINAL = "terminal"  # never going to work; stop asking
     TRANSIENT = "transient"  # try again later
-    FATAL = "fatal"  # not about this item at all; stop the whole run
+    SESSION = "session"  # about the credential, not this item
 
 
 @dataclass(frozen=True)
@@ -58,6 +58,11 @@ class Decision:
     def terminal(self) -> bool:
         return self.disposition is Disposition.TERMINAL
 
+    @property
+    def session_scoped(self) -> bool:
+        """The credential is the problem; this file's budget must not pay for it."""
+        return self.disposition is Disposition.SESSION
+
 
 def classify(exc: BaseException) -> Decision:
     """Decide what a failure means. Never raises."""
@@ -65,11 +70,14 @@ def classify(exc: BaseException) -> Decision:
         if exc.code in RETRYABLE_STATUS:
             return Decision(Disposition.TRANSIENT, f"HTTP {exc.code}")
         if exc.code in SESSION_SCOPED_STATUS:
-            # Not terminal: the premise of phase 1 is that the session token
-            # expires and is replaced by hand, so "this session cannot have it"
-            # is not a permanent fact about the file. Marking these terminal
-            # abandoned 35 files that a fresh token would fetch.
-            return Decision(Disposition.TRANSIENT, f"HTTP {exc.code}")
+            # Its own disposition, not TRANSIENT. Calling it transient routed it
+            # through the per-file retry budget -- six attempts over about half
+            # an hour -- and the end of that budget marks the file unfetchable
+            # anyway. So the policy "a refreshed token changes the answer" was
+            # negated 31 minutes after it was stated, and 66 files were
+            # abandoned in a 2m35s window. The remedy here is a human pasting a
+            # new token, which takes days, not minutes.
+            return Decision(Disposition.SESSION, f"HTTP {exc.code}")
         if 400 <= exc.code < 500:
             return Decision(Disposition.TERMINAL, f"HTTP {exc.code}")
         # 5xx and anything else the server said: the server is having a
@@ -108,8 +116,8 @@ def classify(exc: BaseException) -> Decision:
     return Decision(Disposition.TERMINAL, f"{type(exc).__name__}: {exc}")
 
 
-def next_attempt_at(attempts: int, *, now: datetime | None = None) -> datetime | None:
-    """When a failure that has been tried `attempts` times may be tried again.
+def retry_delay_seconds(attempts: int) -> float | None:
+    """How long to wait before a failure tried `attempts` times is tried again.
 
     None means the budget is spent. Doubling from one minute across six
     attempts, so the last wait is sixteen minutes and the whole budget spans
@@ -121,8 +129,15 @@ def next_attempt_at(attempts: int, *, now: datetime | None = None) -> datetime |
         return None
 
     delay = min(FIRST_DELAY * (2 ** max(attempts - 1, 0)), MAX_DELAY)
-    # nosec: jitter spreads retries so a fleet does not return in lockstep.
-    # It is a load-shaping decision, not a security one -- nothing about the
-    # schedule needs to be unpredictable to an attacker.
-    jittered = delay.total_seconds() * (1 + random.random() * JITTER)  # nosec B311
-    return (now or datetime.now(UTC)) + timedelta(seconds=jittered)
+    # Seconds, not an absolute time. Computing the timestamp here put the Python
+    # clock into a column that _PENDING then compares against Postgres NOW(), in
+    # the same UPDATE that sets last_attempt_at from NOW() -- one statement, two
+    # clocks. Harmless while both are the same kernel; this repo's own backfill
+    # docstring is a warning about what that runtime's clock does across a
+    # suspend.
+    #
+    # nosec: jitter spreads retries so a fleet does not return in lockstep. It
+    # is load shaping, not a security decision -- nothing about the schedule
+    # needs to be unpredictable to an attacker.
+    jitter = 1 + random.random() * JITTER  # nosec B311
+    return float(delay.total_seconds() * jitter)

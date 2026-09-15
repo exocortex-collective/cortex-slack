@@ -113,18 +113,24 @@ def ingest_message(
     # window. Measured: zero parents where stored < claimed, i.e. the sweep's
     # self-correcting arm had never once been able to fire.
     reply_count = int(message.get("reply_count") or 0)
+    # Also lifted out of the payload, and for a second reason beyond symmetry:
+    # the sweep's "is this thread short" question cannot be indexed against a
+    # JSONB extraction, and asking it the slow way put a poll pass at 1202s
+    # against a 300s interval.
+    thread_ts = message.get("thread_ts")
 
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO slack_messages_raw
-                (channel_id, ts, edited_ts, source, raw, reply_count)
-            VALUES (%s, %s, %s, %s, %s, %s)
+                (channel_id, ts, edited_ts, source, raw, reply_count, thread_ts)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (channel_id, ts) DO UPDATE
                SET raw = EXCLUDED.raw,
                    edited_ts = EXCLUDED.edited_ts,
                    source = EXCLUDED.source,
                    reply_count = EXCLUDED.reply_count,
+                   thread_ts = EXCLUDED.thread_ts,
                    fetched_at = NOW()
              -- A changed reply count is a reason to rewrite the row even though
              -- the message itself is untouched: it is the only signal that a
@@ -133,7 +139,7 @@ def ingest_message(
                 OR slack_messages_raw.reply_count IS DISTINCT FROM EXCLUDED.reply_count
             RETURNING (xmax = 0) AS inserted
             """,
-            (channel_id, ts, edited_ts, source, Json(message), reply_count),
+            (channel_id, ts, edited_ts, source, Json(message), reply_count, thread_ts),
         )
         row = cur.fetchone()
 

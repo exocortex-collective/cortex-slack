@@ -544,3 +544,74 @@ def test_a_terminal_failure_is_not_given_a_backoff(
         cur.execute("SELECT attempts FROM slack_files WHERE file_id = 'F1'")
         row = cur.fetchone()
     assert row is not None and row[0] == 0, "spent a retry on something terminal"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://docs.google.com/document/d/abc/edit",
+        "https://drive.google.com/file/d/xyz",
+        "https://app.box.com/s/abc",
+        "https://www.dropbox.com/s/abc/file.pdf",
+        "https://evil.example.com/files.slack.com/x",
+        "http://files.slack.com/f/F1/x",
+    ],
+)
+def test_credentials_are_never_sent_to_a_host_outside_slack(url: str) -> None:
+    """The token reads every conversation the account can see.
+
+    Slack stores an external file -- a Google Doc, a Dropbox link -- as a file
+    object whose url_private points at the third party. A scheme-only check let
+    those through: measured on the live archive, 190 requests carrying
+    `Authorization: Bearer xoxc-...` and `Cookie: d=xoxd-...` went to hosts
+    outside the workspace, 185 of them to docs.google.com. Anyone able to post
+    an external link to a host they control received the session.
+    """
+    with pytest.raises(media_worker.UnsupportedURL):
+        media_worker.download(url, "xoxc-secret", "xoxd-secret")
+
+
+def test_a_slack_file_url_is_allowed() -> None:
+    """The allowlist must not block the 3,900 URLs that are the actual job."""
+    import urllib.request
+
+    called: list[str] = []
+
+    class _Resp:
+        headers = {"Content-Type": "image/png"}
+
+        def read(self, _n: int = 0) -> bytes:
+            return b"PNG"
+
+        def __enter__(self) -> _Resp:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+    class _Opener:
+        def open(self, request: Any, timeout: int = 0) -> _Resp:
+            called.append(request.full_url)
+            return _Resp()
+
+    original = urllib.request.build_opener
+    urllib.request.build_opener = lambda *a, **k: _Opener()  # type: ignore[assignment]
+    try:
+        data = media_worker.download(
+            "https://files.slack.com/files-pri/T1-F1/x.png", "xoxc", "xoxd"
+        )
+    finally:
+        urllib.request.build_opener = original
+
+    assert data == b"PNG"
+    assert called == ["https://files.slack.com/files-pri/T1-F1/x.png"]
+
+
+def test_redirects_are_refused() -> None:
+    """urllib carries Authorization across a cross-host redirect.
+
+    Unlike requests, it does not strip auth when the host changes, so a
+    files.slack.com URL that 302s off-domain would hand the session to wherever
+    it pointed -- defeating the allowlist entirely.
+    """
+    assert media_worker.NoRedirects().redirect_request(None, None, None, None, None) is None

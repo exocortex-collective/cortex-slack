@@ -46,7 +46,20 @@ _PENDING = """
 SELECT r.channel_id, r.ts, r.raw
   FROM slack_messages_raw r
   LEFT JOIN slack_messages m ON m.channel_id = r.channel_id AND m.ts = r.ts
- WHERE m.ts IS NULL
+ -- Unparsed, OR parsed before the raw row was last refetched. The second half
+ -- was missing: ingest goes to real trouble to detect a changed message and
+ -- return UPDATED, and that outcome stopped at the raw tier. Measured live --
+ -- 11 rows whose raw carried an edited_ts their parsed row did not, each
+ -- parsed about ten minutes before the edit arrived, and nothing would ever
+ -- have revisited them. The ON CONFLICT DO UPDATE below was written for this
+ -- case and was unreachable.
+ --
+ -- It matters far more since reply_count began triggering a rewrite: that
+ -- happens every time a reply lands on a thread parent, so text, reactions and
+ -- tags would go stale for every active thread.
+ --
+ -- Both timestamps are server NOW(), so this compares one clock.
+ WHERE (m.ts IS NULL OR m.parsed_at < r.fetched_at)
    AND (r.channel_id, r.ts) > (%s, %s)
  ORDER BY r.channel_id, r.ts
  LIMIT %s

@@ -77,7 +77,7 @@ SELECT p.channel_id, p.ts
          (p.reply_count > 0
           AND (SELECT count(*) FROM slack_messages_raw r
                 WHERE r.channel_id = p.channel_id
-                  AND r.raw->>'thread_ts' = p.ts
+                  AND r.thread_ts = p.ts
                   AND r.ts <> p.ts) < p.reply_count)
        OR
          -- Or recent enough to still attract a first reply, and due a re-check.

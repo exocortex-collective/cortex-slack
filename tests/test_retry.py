@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ssl
 import urllib.error
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 import pytest
 
@@ -12,7 +12,7 @@ from cortex_slack.retry import (
     MAX_ATTEMPTS,
     Disposition,
     classify,
-    next_attempt_at,
+    retry_delay_seconds,
 )
 
 
@@ -82,17 +82,13 @@ def test_the_reason_survives_classification() -> None:
 
 def test_the_first_retry_is_not_immediate() -> None:
     """The whole point: five attempts inside one outage is not a retry policy."""
-    now = datetime.now(UTC)
+    delay = retry_delay_seconds(1)
 
-    due = next_attempt_at(1, now=now)
-
-    assert due is not None and due > now + timedelta(seconds=30)
+    assert delay is not None and delay > 30
 
 
 def test_the_delay_grows() -> None:
-    now = datetime.now(UTC)
-
-    delays = [next_attempt_at(n, now=now) for n in range(1, 5)]
+    delays = [retry_delay_seconds(n) for n in range(1, 5)]
 
     assert all(d is not None for d in delays)
     assert delays == sorted(delays), f"backoff did not grow: {delays}"  # type: ignore[type-var]
@@ -100,16 +96,14 @@ def test_the_delay_grows() -> None:
 
 def test_the_delay_is_capped() -> None:
     """An unbounded double reaches days, which abandons a recoverable file."""
-    now = datetime.now(UTC)
+    delay = retry_delay_seconds(MAX_ATTEMPTS - 1)
 
-    due = next_attempt_at(MAX_ATTEMPTS - 1, now=now)
-
-    assert due is not None and due < now + timedelta(hours=8)
+    assert delay is not None and delay < timedelta(hours=8).total_seconds()
 
 
 def test_the_budget_runs_out() -> None:
     """None is how the caller learns to stop, rather than retrying forever."""
-    assert next_attempt_at(MAX_ATTEMPTS) is None
+    assert retry_delay_seconds(MAX_ATTEMPTS) is None
 
 
 def test_retries_are_jittered() -> None:
@@ -117,11 +111,21 @@ def test_retries_are_jittered() -> None:
 
     Without jitter the retry wave reproduces the load that caused the outage.
     """
-    now = datetime.now(UTC)
+    delays = {retry_delay_seconds(2) for _ in range(20)}
 
-    dues = {next_attempt_at(2, now=now) for _ in range(20)}
+    assert len(delays) > 1, "every retry scheduled for the same moment"
 
-    assert len(dues) > 1, "every retry scheduled for the same moment"
+
+def test_the_delay_is_a_duration_not_a_timestamp() -> None:
+    """The server does the arithmetic, so one clock decides.
+
+    Returning an absolute time put the Python clock into a column that the work
+    query compares against Postgres NOW(), in the same UPDATE that sets
+    last_attempt_at from NOW() -- one statement, two clocks.
+    """
+    delay = retry_delay_seconds(1)
+
+    assert isinstance(delay, float)
 
 
 def test_a_truncated_read_is_transient() -> None:
@@ -140,13 +144,19 @@ def test_a_truncated_read_is_transient() -> None:
 
 
 @pytest.mark.parametrize("code", [401, 403])
-def test_authorization_failures_are_session_scoped_not_terminal(code: int) -> None:
-    """Phase 1's premise is that the token expires and is replaced by hand.
+def test_authorization_failures_are_session_scoped(code: int) -> None:
+    """Not terminal, and not transient either.
 
-    "This session cannot have it" is not a permanent fact about the file, and
-    treating it as one abandoned 35 files a fresh token would fetch.
+    Calling them transient routed them through the per-file retry budget, whose
+    exhaustion marks the file unfetchable anyway -- so the policy was negated 31
+    minutes after being stated, and 66 files were abandoned in a 2m35s window.
+    The remedy is a human pasting a new token, which takes days.
     """
-    assert classify(_http(code)).disposition is Disposition.TRANSIENT
+    decision = classify(_http(code))
+
+    assert decision.disposition is Disposition.SESSION
+    assert not decision.terminal
+    assert decision.session_scoped
 
 
 def test_the_delay_cap_is_reachable() -> None:

@@ -267,16 +267,19 @@ def test_a_complete_old_thread_is_not_swept(clean: psycopg2.extensions.connectio
     _channel(clean)
     old = "1600000000.000001"
     _parent(clean, old, replies=1)
-    with clean.cursor() as cur:  # its one reply is already stored
-        cur.execute(
-            "INSERT INTO slack_messages_raw (channel_id, ts, source, raw) VALUES "
-            "(%s, %s, 'poll', %s)",
-            (
-                C1,
-                "1600000001.000001",
-                '{"ts": "1600000001.000001", "thread_ts": "1600000000.000001"}',
-            ),
-        )
+    # Through ingest_message, not raw SQL. thread_ts is a column now, and the
+    # sweep's short-thread check reads it -- a direct INSERT that leaves it null
+    # makes a complete thread look incomplete and the test asserts the opposite
+    # of what it means to.
+    from cortex_slack.ingest import ingest_message
+
+    ingest_message(
+        clean,
+        C1,
+        {"type": "message", "ts": "1600000001.000001", "thread_ts": old, "user": "U2"},
+        source="poll",
+        enqueue_parse=False,
+    )
     clean.commit()
 
     poll_once(clean, _ThreadClient())  # type: ignore[arg-type]

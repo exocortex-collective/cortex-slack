@@ -35,7 +35,7 @@ from cortex_utils.logging import configure_logging, get_logger
 from psycopg2.extras import Json
 
 from cortex_slack.config import apply_schema, dsn_from_env, stealth_tokens
-from cortex_slack.retry import classify, next_attempt_at
+from cortex_slack.retry import classify, retry_delay_seconds
 from cortex_slack.slack.api import SlackAuthError, SlackClient
 from cortex_slack.storage import S3Client
 
@@ -48,6 +48,45 @@ MAX_BYTES = 200 * 1024 * 1024
 # remaining evidence the file existed -- but there is nothing to fetch, and
 # retrying forever would spend the rate budget on certain failure.
 TOMBSTONE_MODES = frozenset({"tombstone"})
+
+
+# The only hosts this worker will send the session credentials to.
+#
+# Slack stores an "external" file -- a Google Doc, a Dropbox link -- as a file
+# object whose url_private points at the third party. Checking only the scheme
+# let those through, and every attempt sent `Authorization: Bearer xoxc-...`
+# and `Cookie: d=xoxd-...` to a host outside the workspace. Measured on the
+# live archive before this was fixed: 190 transmissions, 185 of them to
+# docs.google.com. That token reads every conversation the account can read, so
+# anyone able to post an external link to a host they control receives it.
+#
+# The allowlist costs nothing: 3,900 of 3,966 file URLs are files.slack.com,
+# and all 66 external ones are unfetchable anyway -- 0 stored, 4xx across the
+# board. They keep their metadata row, which is the record that the file
+# existed, and that is what the archive is for.
+ALLOWED_FILE_HOSTS = frozenset({"files.slack.com"})
+
+
+class UnsupportedURL(RuntimeError):
+    """Not a URL this worker will send credentials to.
+
+    Terminal by construction, and deliberately not FileTooLarge: that means the
+    file exceeded the size ceiling, and conflating two unrelated permanent
+    conditions is the mistake migration 003 exists to undo.
+    """
+
+
+class NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow a redirect.
+
+    urllib copies every header except content-* across a cross-host redirect --
+    unlike requests, it does not strip Authorization when the host changes. So a
+    files.slack.com URL that 302s off-domain would hand the session to wherever
+    it pointed, defeating the allowlist above.
+    """
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
 
 
 class FileTooLarge(RuntimeError):
@@ -112,6 +151,10 @@ SELECT file_id, raw, attempts
 # returns again -- four restarts in two minutes, each logging "all files
 # stored". That is the same fault cortex-gmail-sync had, where a recoverable
 # condition was handled by dying and letting the restart policy cope.
+# How long to wait before retrying a file blocked by a credential problem. Long,
+# because the remedy is a person pasting a new token.
+SESSION_RETRY_SECONDS = 3600.0
+
 IDLE_SECONDS = 60.0
 DISCOVERY_INTERVAL_SECONDS = 600.0
 STOP_POLL_SECONDS = 0.5
@@ -213,19 +256,20 @@ def download(url: str, xoxc: str, xoxd: str, timeout: int = 120) -> bytes:
     200 -- not an error, just the wrong bytes, silently stored as if it were the
     file.
     """
-    # The scheme is checked because this URL is payload data, not ours. urlopen
-    # honours file:// and ftp://, so a url_private of "file:///etc/passwd" -- from
-    # a compromised workspace, a malicious app posting a file, or simply a Slack
-    # response shape we did not anticipate -- would be read off this host's disk
-    # and written into the bucket as if it were an attachment.
-    if urllib.parse.urlparse(url).scheme not in ("https", "http"):
-        raise FileTooLarge(f"refusing non-http url: {url[:80]}")
+    # The HOST is checked, not just the scheme. This URL is payload data, and the
+    # credentials below are the session for the entire workspace -- so the
+    # question is not "is this fetchable" but "may this host be told the token".
+    # A scheme-only check answered the wrong one: https://evil.example/ passes it.
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in ALLOWED_FILE_HOSTS:
+        raise UnsupportedURL(f"refusing {parsed.scheme}://{parsed.hostname}")
 
     request = urllib.request.Request(
         url,
         headers={"Authorization": f"Bearer {xoxc}", "Cookie": f"d={xoxd}"},
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
+    opener = urllib.request.build_opener(NoRedirects)
+    with opener.open(request, timeout=timeout) as response:  # nosec B310
         content_type = response.headers.get("Content-Type", "")
         data: bytes = response.read(MAX_BYTES + 1)
 
@@ -326,15 +370,16 @@ def _store_one(
 
     try:
         data = download(url, xoxc, xoxd)
-    except FileTooLarge as exc:
-        # Terminal by construction: the ceiling will not be met by waiting.
+    except (FileTooLarge, UnsupportedURL) as exc:
+        # Terminal by construction: neither a size ceiling nor a disallowed host
+        # will be met by waiting.
         _mark_unfetchable(conn, file_id, str(exc))
         return Outcome.GIVEN_UP
     except CredentialsRejected as exc:
         # Through the retry budget, not the tombstone. Marking these permanently
         # unfetchable abandoned 31 files that a refreshed token would fetch, and
         # nothing clears fetch_error.
-        _record_attempt(conn, file_id, attempts + 1, f"sign-in page: {exc}")
+        _defer(conn, file_id, f"sign-in page: {exc}")
         return Outcome.SIGN_IN
     except Exception as exc:  # noqa: BLE001 - classify() decides what it means
         return _record_failure(conn, file_id, attempts, exc, prefix="")
@@ -370,23 +415,51 @@ def _record_failure(
     if decision.terminal:
         _mark_unfetchable(conn, file_id, f"{prefix}{decision.reason}")
         return Outcome.GIVEN_UP
+    if decision.session_scoped:
+        # Delay it, but do not charge the file. The run-level guard is the right
+        # place to decide a dead session has stopped everything: five sign-in
+        # pages plus a failed auth.test. Spending this file's six attempts on a
+        # credential problem abandons it for a reason that has nothing to do
+        # with the file.
+        _defer(conn, file_id, f"{prefix}{decision.reason}")
+        return Outcome.SIGN_IN
     _record_attempt(conn, file_id, attempts + 1, f"{prefix}{decision.reason}")
     return Outcome.RETRY
+
+
+def _defer(conn: psycopg2.extensions.connection, file_id: str, why: str) -> None:
+    """Push a file past a credential problem without spending its budget."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE slack_files SET last_attempt_at = NOW(), "
+            "next_attempt_at = NOW() + make_interval(secs => %s) WHERE file_id = %s",
+            (SESSION_RETRY_SECONDS, file_id),
+        )
+    conn.commit()
+    logger.info("deferred for a credential problem", file_id=file_id, reason=why)
 
 
 def _record_attempt(
     conn: psycopg2.extensions.connection, file_id: str, attempts: int, why: str
 ) -> None:
     """Schedule a transient failure's next try, or give up once out of budget."""
-    due = next_attempt_at(attempts)
-    if due is None:
+    delay = retry_delay_seconds(attempts)
+    if delay is None:
+        # Record the attempt count alongside the verdict. It used to write only
+        # fetch_error, so 66 rows read "failed 6 times" while the column said 5
+        # -- an operator clearing fetch_error gave each file one more try, not
+        # six.
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE slack_files SET attempts = %s WHERE file_id = %s", (attempts, file_id)
+            )
         _mark_unfetchable(conn, file_id, f"failed {attempts} times, last: {why[:200]}")
         return
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE slack_files SET attempts = %s, last_attempt_at = NOW(), "
-            "next_attempt_at = %s WHERE file_id = %s",
-            (attempts, due, file_id),
+            "next_attempt_at = NOW() + make_interval(secs => %s) WHERE file_id = %s",
+            (attempts, delay, file_id),
         )
     conn.commit()
     logger.warning(
@@ -394,7 +467,7 @@ def _record_attempt(
         file_id=file_id,
         attempt=attempts,
         error=why,
-        next_attempt_at=due.isoformat(),
+        in_seconds=round(delay),
     )
 
 
