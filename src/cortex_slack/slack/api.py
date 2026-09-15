@@ -134,6 +134,12 @@ class SlackClient:
     ) -> None:
         self._token = xoxc_token
         self._cookie = xoxd_token
+        # Checked once here rather than on every request. urlopen honours
+        # file:// and ftp://, and this value comes from the environment, so a
+        # misconfigured SLACK_BASE_URL would otherwise turn every API call into
+        # a local file read that returns something plausible-looking.
+        if urllib.parse.urlparse(base_url).scheme not in ("https", "http"):
+            raise ValueError(f"SLACK_BASE_URL must be http(s): {base_url!r}")
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._max_retries = max_retries
@@ -169,7 +175,9 @@ class SlackClient:
                 },
             )
             try:
-                with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                with urllib.request.urlopen(  # nosec B310 - scheme checked in __init__
+                    request, timeout=self._timeout
+                ) as response:
                     payload: dict[str, Any] = json.loads(response.read())
             except urllib.error.HTTPError as exc:
                 delay = _retry_after(exc)

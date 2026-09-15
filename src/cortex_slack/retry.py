@@ -121,5 +121,8 @@ def next_attempt_at(attempts: int, *, now: datetime | None = None) -> datetime |
         return None
 
     delay = min(FIRST_DELAY * (2 ** max(attempts - 1, 0)), MAX_DELAY)
-    jittered = delay.total_seconds() * (1 + random.random() * JITTER)
+    # nosec: jitter spreads retries so a fleet does not return in lockstep.
+    # It is a load-shaping decision, not a security one -- nothing about the
+    # schedule needs to be unpredictable to an attacker.
+    jittered = delay.total_seconds() * (1 + random.random() * JITTER)  # nosec B311
     return (now or datetime.now(UTC)) + timedelta(seconds=jittered)

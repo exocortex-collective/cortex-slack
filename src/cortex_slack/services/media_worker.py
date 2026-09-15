@@ -24,6 +24,7 @@ import signal
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from enum import StrEnum
@@ -212,11 +213,19 @@ def download(url: str, xoxc: str, xoxd: str, timeout: int = 120) -> bytes:
     200 -- not an error, just the wrong bytes, silently stored as if it were the
     file.
     """
+    # The scheme is checked because this URL is payload data, not ours. urlopen
+    # honours file:// and ftp://, so a url_private of "file:///etc/passwd" -- from
+    # a compromised workspace, a malicious app posting a file, or simply a Slack
+    # response shape we did not anticipate -- would be read off this host's disk
+    # and written into the bucket as if it were an attachment.
+    if urllib.parse.urlparse(url).scheme not in ("https", "http"):
+        raise FileTooLarge(f"refusing non-http url: {url[:80]}")
+
     request = urllib.request.Request(
         url,
         headers={"Authorization": f"Bearer {xoxc}", "Cookie": f"d={xoxd}"},
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:  # nosec B310
         content_type = response.headers.get("Content-Type", "")
         data: bytes = response.read(MAX_BYTES + 1)
 
