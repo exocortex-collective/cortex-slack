@@ -28,6 +28,7 @@ from cortex_utils.logging import get_logger
 
 from cortex_slack.ingest import Outcome, ingest_message
 from cortex_slack.slack.api import TS_PATTERN, SlackAuthError, SlackClient, SlackError
+from cortex_slack.threads import starts_a_thread, walk_thread
 
 logger = get_logger(__name__)
 
@@ -64,7 +65,15 @@ def ts_minus_seconds(ts: str, seconds: int) -> str:
     Never float arithmetic: float("1725379200.001500") is not exact at this
     magnitude and the suffix is what distinguishes two messages in the same
     second. Only the integer part moves.
+
+    Validates first. int(whole) raises ValueError on a non-numeric watermark,
+    and ValueError is not a SlackError -- so it escaped poll_once's per-channel
+    handler, left main() uncaught, and crash-looped all 323 channels because one
+    row was bad. The guard downstream was written for this and sat one line too
+    late to catch it.
     """
+    if not TS_PATTERN.match(ts):
+        raise SlackError("conversations.history", f"bad watermark {ts!r}")
     whole, _, micros = ts.partition(".")
     return f"{max(int(whole) - seconds, 0)}.{micros or '000000'}"
 
@@ -113,10 +122,6 @@ def _poll_channel(
     # the newest message actually seen, never to "now" -- a mark set from the
     # clock covers a window the scan may not have finished reading.
     oldest = ts_minus_seconds(last_ts, overlap_seconds) if last_ts else None
-    if oldest is not None and not TS_PATTERN.match(oldest):
-        # A malformed watermark would be silently ignored by the API, which
-        # returns the whole channel rather than an error.
-        raise SlackError("conversations.history", f"bad watermark {oldest!r}")
 
     newest_seen = last_ts
     channel_errors = 0
@@ -145,6 +150,18 @@ def _poll_channel(
         else:
             stats.unchanged += 1
 
+        # conversations.history returns thread parents only. The backfill walks
+        # threads and the poller did not, so three days of polling stored 5 of
+        # 48 replies -- and only because thread_broadcast is mirrored into the
+        # channel. A reply does not change its parent's ts, so nothing would
+        # ever have re-read them.
+        if starts_a_thread(message):
+            ingested, failed = walk_thread(
+                conn, client, channel_id, str(message["ts"]), source=SOURCE
+            )
+            stats.stored += ingested
+            channel_errors += failed
+
         if isinstance(ts, str) and (newest_seen is None or ts > newest_seen):
             # String comparison is correct here: every Slack ts is exactly ten
             # digits, a dot, then six, so lexicographic and numeric order agree
@@ -152,28 +169,37 @@ def _poll_channel(
             newest_seen = ts
 
     stats.errors += channel_errors
-    if channel_errors == 0 and newest_seen is not None:
+    if channel_errors == 0:
         _advance(conn, channel_id, newest_seen)
     conn.commit()
 
 
-def _advance(conn: psycopg2.extensions.connection, channel_id: str, last_ts: str) -> None:
+def _advance(conn: psycopg2.extensions.connection, channel_id: str, last_ts: str | None) -> None:
+    """Record a clean pass, moving the watermark if there is anywhere to move it.
+
+    "I polled this cleanly" and "the watermark moved" are different facts, and
+    bundling them hid the first. A quiet channel reaches here with last_ts
+    unchanged -- the overwhelmingly common case -- and a WHERE guarding the whole
+    row meant last_synced_at was never written and a stale last_error was never
+    cleared. Measured after three days of clean five-minute passes: 308 of 323
+    channels still carried the backfill's timestamp and were indistinguishable
+    from never having been polled.
+
+    GREATEST keeps the never-move-backwards property -- a deleted newest message
+    would otherwise rewind the mark and re-ingest history forever -- and is
+    NULL-safe in Postgres, so a first pass over an empty channel still records
+    itself.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO slack_sync_state (channel_id, last_ts, last_synced_at, last_error)
             VALUES (%s, %s, NOW(), NULL)
             ON CONFLICT (channel_id) DO UPDATE
-               SET last_ts = EXCLUDED.last_ts,
+               SET last_ts = GREATEST(slack_sync_state.last_ts, EXCLUDED.last_ts),
                    last_synced_at = EXCLUDED.last_synced_at,
                    last_error = NULL,
                    updated_at = NOW()
-             -- Never move the mark backwards. A channel read with an overlap
-             -- window can return an older newest-message than the stored one if
-             -- the newest was deleted, and rewinding would re-ingest history
-             -- every pass forever.
-             WHERE slack_sync_state.last_ts IS NULL
-                OR EXCLUDED.last_ts > slack_sync_state.last_ts
             """,
             (channel_id, last_ts),
         )

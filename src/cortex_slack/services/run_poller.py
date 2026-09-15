@@ -22,7 +22,7 @@ from cortex_utils.metrics import start_metrics_server
 from cortex_slack.config import apply_schema, dsn_from_env, stealth_tokens
 from cortex_slack.services.dimensions import upsert_channels, upsert_users
 from cortex_slack.services.poller import poll_once
-from cortex_slack.slack.api import SlackAuthError, SlackClient
+from cortex_slack.slack.api import SlackAuthError, SlackClient, SlackError
 
 logger = get_logger(__name__)
 
@@ -67,9 +67,23 @@ def main() -> int:
     while not stop["requested"]:
         started = time.monotonic()
         try:
-            channels = list(client.list_channels())
-            upsert_channels(conn, channels)
-            upsert_users(conn, list(client.list_users()))
+            try:
+                upsert_channels(conn, list(client.list_channels()))
+                upsert_users(conn, list(client.list_users()))
+            except SlackAuthError:
+                raise  # a dead credential is not a staleness problem
+            except SlackError as exc:
+                # A staleness optimisation must not be able to stop the sync
+                # whose gaps are permanent. Rate limiting surviving five
+                # retries, or a fatal_error on either list call, used to
+                # propagate out of main() and crash-loop with no backoff --
+                # while poll_once goes to real trouble to survive exactly this
+                # class of error per channel.
+                logger.warning(
+                    "dimension refresh failed; polling on last cycle's dimensions",
+                    error=str(exc),
+                )
+                conn.rollback()
             stats = poll_once(conn, client, overlap_seconds=overlap)
         except SlackAuthError as exc:
             # The expected end of phase 1, not a crash. Say so plainly and stop:

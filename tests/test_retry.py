@@ -23,7 +23,7 @@ def _http(code: int) -> urllib.error.HTTPError:
 # -- classification ------------------------------------------------------------
 
 
-@pytest.mark.parametrize("code", [400, 401, 403, 404, 410, 422])
+@pytest.mark.parametrize("code", [400, 404, 410, 422])
 def test_client_errors_are_terminal(code: int) -> None:
     """The request is the problem; repeating it unchanged cannot fix that.
 
@@ -122,3 +122,40 @@ def test_retries_are_jittered() -> None:
     dues = {next_attempt_at(2, now=now) for _ in range(20)}
 
     assert len(dues) > 1, "every retry scheduled for the same moment"
+
+
+def test_a_truncated_read_is_transient() -> None:
+    """http.client.HTTPException is NOT an OSError.
+
+    It descends straight from Exception, so the broad OSError clause never
+    caught it and IncompleteRead -- a connection dropped mid-body, the most
+    likely failure for a large file over a CDN -- was classified terminal and
+    the file permanently abandoned.
+    """
+    import http.client
+
+    assert not issubclass(http.client.HTTPException, OSError)
+    assert classify(http.client.IncompleteRead(b"partial")).disposition is Disposition.TRANSIENT
+    assert classify(http.client.BadStatusLine("garbage")).disposition is Disposition.TRANSIENT
+
+
+@pytest.mark.parametrize("code", [401, 403])
+def test_authorization_failures_are_session_scoped_not_terminal(code: int) -> None:
+    """Phase 1's premise is that the token expires and is replaced by hand.
+
+    "This session cannot have it" is not a permanent fact about the file, and
+    treating it as one abandoned 35 files a fresh token would fetch.
+    """
+    assert classify(_http(code)).disposition is Disposition.TRANSIENT
+
+
+def test_the_delay_cap_is_reachable() -> None:
+    """A cap the budget can never reach is a docstring that lies.
+
+    MAX_ATTEMPTS = 6 doubling from one minute tops out at sixteen, so a
+    six-hour MAX_DELAY described a behaviour that could not occur.
+    """
+    from cortex_slack.retry import FIRST_DELAY, MAX_DELAY
+
+    largest = FIRST_DELAY * (2 ** (MAX_ATTEMPTS - 2))
+    assert largest >= MAX_DELAY, f"cap {MAX_DELAY} unreachable; largest delay is {largest}"

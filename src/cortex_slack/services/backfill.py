@@ -22,6 +22,7 @@ from cortex_utils.logging import get_logger
 
 from cortex_slack.ingest import Outcome, ingest_message
 from cortex_slack.slack.api import SlackAuthError, SlackClient, SlackError
+from cortex_slack.threads import starts_a_thread, walk_thread
 
 logger = get_logger(__name__)
 
@@ -210,9 +211,11 @@ def _walk_channel(
             else:
                 unchanged += 1
 
-            if _has_thread(message):
+            if starts_a_thread(message):
                 threads += 1
-                ingested, failed = _walk_thread(conn, client, channel_id, str(message["ts"]))
+                ingested, failed = walk_thread(
+                    conn, client, channel_id, str(message["ts"]), source=SOURCE
+                )
                 replies += ingested
                 errors += failed
 
@@ -232,55 +235,6 @@ def _walk_channel(
             cursor = next_cursor
 
     return ChannelResult(channel_id, stored, updated, unchanged, threads, replies, errors)
-
-
-def _walk_thread(
-    conn: psycopg2.extensions.connection, client: SlackClient, channel_id: str, thread_ts: str
-) -> tuple[int, int]:
-    """Ingest a thread's replies. Returns (ingested, errors).
-
-    conversations.history does not return replies, so a channel scan alone
-    captures only the parents -- and a Slack conversation's meaning usually
-    lives in the thread rather than the message that started it. The parent
-    comes back here too and re-ingests as UNCHANGED, so it is not filtered.
-    """
-    ingested = errors = 0
-    for reply in client.replies(channel_id, thread_ts):
-        try:
-            ingest_message(conn, channel_id, reply, source=SOURCE, enqueue_parse=ENQUEUE_PARSE)
-            # The parent comes back in this response and was already counted by
-            # the history walk that got us here. Counting it again turns the
-            # undercount this fix was for into an overcount, which is no more
-            # reconcilable against the row count than the original was.
-            # A thread_broadcast is returned by conversations.history AND by
-            # conversations.replies, and its ts differs from thread_ts, so
-            # counting it here counts it twice. Measured: exactly 4,319 of them,
-            # which is precisely how far the total over-reported.
-            if reply.get("ts") != thread_ts and reply.get("subtype") != "thread_broadcast":
-                ingested += 1
-        except Exception as exc:  # noqa: BLE001
-            errors += 1
-            logger.warning(
-                "reply ingest failed",
-                channel=channel_id,
-                thread_ts=thread_ts,
-                ts=reply.get("ts"),
-                error=str(exc),
-            )
-            conn.rollback()
-    return ingested, errors
-
-
-def _has_thread(message: dict[str, Any]) -> bool:
-    """True when this message starts a thread that has replies.
-
-    `thread_ts == ts` identifies the parent; a reply carries the parent's
-    thread_ts and would send us round the same thread once per reply.
-    """
-    thread_ts = message.get("thread_ts")
-    if thread_ts is None or thread_ts != message.get("ts"):
-        return False
-    return int(message.get("reply_count") or 0) > 0
 
 
 def _claim(conn: psycopg2.extensions.connection) -> tuple[int, str, str | None] | None:

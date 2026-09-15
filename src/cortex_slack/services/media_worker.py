@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from enum import StrEnum
 from typing import Any
 
 import psycopg2
@@ -34,7 +35,7 @@ from psycopg2.extras import Json
 
 from cortex_slack.config import apply_schema, dsn_from_env, stealth_tokens
 from cortex_slack.retry import classify, next_attempt_at
-from cortex_slack.slack.api import SlackClient
+from cortex_slack.slack.api import SlackAuthError, SlackClient
 from cortex_slack.storage import S3Client
 
 logger = get_logger(__name__)
@@ -142,6 +143,7 @@ def discover_files(conn: psycopg2.extensions.connection, limit: int = 500) -> in
             cur.execute(_DISCOVER, (after[0], after[1], limit))
             rows = cur.fetchall()
         if not rows:
+            conn.rollback()  # same reason as store_pending: do not idle in a transaction
             return written
 
         with conn.cursor() as cur:
@@ -226,6 +228,13 @@ def download(url: str, xoxc: str, xoxd: str, timeout: int = 120) -> bytes:
     return data
 
 
+class Outcome(StrEnum):
+    STORED = "stored"
+    RETRY = "retry"  # transient; scheduled for another attempt
+    GIVEN_UP = "given_up"  # terminal, or out of budget
+    SIGN_IN = "sign_in"  # a sign-in page: says something about the session
+
+
 def store_pending(
     conn: psycopg2.extensions.connection,
     s3: Any,
@@ -240,37 +249,40 @@ def store_pending(
     query returned, and it is the ONLY safe termination signal: stored and
     failed are both zero for a batch that was entirely unfetchable, so treating
     (0, 0) as "nothing left to do" ends the run while thousands of files are
-    still pending. That is not a hypothetical -- it happened on the first real
+    still pending. That is not hypothetical -- it happened on the first real
     run, which logged "all files stored" with 3,203 outstanding.
     """
     with conn.cursor() as cur:
         cur.execute(_PENDING, (limit,))
         rows = cur.fetchall()
+    # End the transaction psycopg2 opened on that SELECT. Without this the
+    # connection sits "idle in transaction" through the 60s idle wait and the
+    # 600s discovery interval, holding ACCESS SHARE on slack_files and
+    # slack_messages_raw -- measured live at 4m26s. Any container booting runs
+    # apply_schema(), whose ALTER TABLE needs ACCESS EXCLUSIVE, and Postgres'
+    # lock queue is FIFO: that ALTER waits, and every later reader and writer
+    # queues behind it, stalling the poller and the parse worker.
+    #
+    # This is the same fault the parse worker had, reintroduced here by the fix
+    # that made this worker wait instead of exiting -- process exit used to
+    # close the connection.
+    conn.rollback()
 
     stored = failed = 0
     consecutive_html = 0
     for file_id, raw, attempts in rows:
-        url = raw.get("url_private_download") or raw.get("url_private")
-        if not url:
-            # No URL at all: nothing to fetch, ever. Left pending would make it
-            # a permanent resident of the work queue.
-            _mark_unfetchable(conn, file_id, "no download url")
-            continue
-        try:
-            data = download(url, xoxc, xoxd)
-        except FileTooLarge as exc:
-            # Terminal by construction: the ceiling will not be met by waiting.
-            _mark_unfetchable(conn, file_id, str(exc))
-            continue
-        except CredentialsRejected as exc:
-            # MUST precede the broad handler: this used to be a PermissionError,
-            # an OSError subclass, so the clause below caught it first and this
-            # branch was unreachable.
+        outcome = _store_one(conn, s3, file_id, raw, attempts, xoxc, xoxd)
+
+        if outcome is Outcome.STORED:
+            stored += 1
+            consecutive_html = 0
+        elif outcome is Outcome.RETRY:
+            failed += 1
+        elif outcome is Outcome.SIGN_IN:
+            failed += 1
             consecutive_html += 1
             if consecutive_html >= CREDENTIAL_FAILURES_BEFORE_CHECKING:
                 if verify_session is not None and verify_session():
-                    # The session is fine; these files are individually
-                    # unreachable. Reset so a later genuine expiry still trips.
                     logger.info(
                         "several sign-in pages, but the session is still valid",
                         consecutive=consecutive_html,
@@ -282,29 +294,75 @@ def store_pending(
                         file_id=file_id,
                         consecutive=consecutive_html,
                     )
-                    raise
-            _mark_unfetchable(conn, file_id, f"sign-in page: {exc}")
-            continue
-        except Exception as exc:  # noqa: BLE001 - classify() decides what it means
-            decision = classify(exc)
-            if decision.terminal:
-                _mark_unfetchable(conn, file_id, decision.reason)
-                continue
-            failed += 1
-            _record_attempt(conn, file_id, attempts + 1, decision.reason)
-            continue
-
-        consecutive_html = 0
-        key = s3_key_for(file_id, raw.get("name"))
-        s3.put_bytes(key, data)
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE slack_files SET s3_key = %s, stored_at = NOW() WHERE file_id = %s",
-                (key, file_id),
-            )
-        conn.commit()
-        stored += 1
+                    raise CredentialsRejected("session is no longer valid")
     return stored, failed, len(rows)
+
+
+def _store_one(
+    conn: psycopg2.extensions.connection,
+    s3: Any,
+    file_id: str,
+    raw: dict[str, Any],
+    attempts: int,
+    xoxc: str,
+    xoxd: str,
+) -> Outcome:
+    """Fetch and store one file, recording whatever happened to it."""
+    url = raw.get("url_private_download") or raw.get("url_private")
+    if not url:
+        # Nothing to fetch, ever. Left pending it would be a permanent resident
+        # of the work queue.
+        _mark_unfetchable(conn, file_id, "no download url")
+        return Outcome.GIVEN_UP
+
+    try:
+        data = download(url, xoxc, xoxd)
+    except FileTooLarge as exc:
+        # Terminal by construction: the ceiling will not be met by waiting.
+        _mark_unfetchable(conn, file_id, str(exc))
+        return Outcome.GIVEN_UP
+    except CredentialsRejected as exc:
+        # Through the retry budget, not the tombstone. Marking these permanently
+        # unfetchable abandoned 31 files that a refreshed token would fetch, and
+        # nothing clears fetch_error.
+        _record_attempt(conn, file_id, attempts + 1, f"sign-in page: {exc}")
+        return Outcome.SIGN_IN
+    except Exception as exc:  # noqa: BLE001 - classify() decides what it means
+        return _record_failure(conn, file_id, attempts, exc, prefix="")
+
+    key = s3_key_for(file_id, raw.get("name"))
+    try:
+        s3.put_bytes(key, data)
+    except Exception as exc:  # noqa: BLE001
+        # The only network call in the loop that had no handler. A MinIO restart
+        # propagated out of main(), and restart: unless-stopped brought the
+        # worker back to the same unavailable MinIO -- an unbounded crash loop
+        # that also discarded bytes just fetched against a rate-limited API.
+        return _record_failure(conn, file_id, attempts, exc, prefix="s3: ")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE slack_files SET s3_key = %s, stored_at = NOW() WHERE file_id = %s",
+            (key, file_id),
+        )
+    conn.commit()
+    return Outcome.STORED
+
+
+def _record_failure(
+    conn: psycopg2.extensions.connection,
+    file_id: str,
+    attempts: int,
+    exc: Exception,
+    *,
+    prefix: str,
+) -> Outcome:
+    decision = classify(exc)
+    if decision.terminal:
+        _mark_unfetchable(conn, file_id, f"{prefix}{decision.reason}")
+        return Outcome.GIVEN_UP
+    _record_attempt(conn, file_id, attempts + 1, f"{prefix}{decision.reason}")
+    return Outcome.RETRY
 
 
 def _record_attempt(
@@ -345,6 +403,22 @@ def _mark_unfetchable(conn: psycopg2.extensions.connection, file_id: str, why: s
     logger.info("file unfetchable", file_id=file_id, reason=why)
 
 
+def _build_clients(conn: psycopg2.extensions.connection) -> tuple[SlackClient, Any, str, str]:
+    """Everything that talks to something outside this process."""
+    xoxc, xoxd = stealth_tokens()
+    base_url = os.environ.get("SLACK_BASE_URL")
+    if not base_url:
+        raise SystemExit("SLACK_BASE_URL is not set")
+    client = SlackClient(xoxc, xoxd, base_url)
+    s3 = S3Client(
+        endpoint_url=os.environ.get("S3_ENDPOINT"),
+        aws_access_key_id=os.environ.get("S3_ACCESS_KEY", ""),
+        aws_secret_access_key=os.environ.get("S3_SECRET_KEY", ""),
+        bucket_name=os.environ.get("S3_BUCKET", "cortex-slack-files"),
+    )
+    return client, s3, xoxc, xoxd
+
+
 def main() -> int:
     configure_logging("slack-media-worker", os.environ.get("LOG_LEVEL", "INFO"))
     stop = {"requested": False}
@@ -357,24 +431,25 @@ def main() -> int:
 
     conn = psycopg2.connect(dsn_from_env())
     apply_schema(conn)
-    xoxc, xoxd = stealth_tokens()
-    base_url = os.environ.get("SLACK_BASE_URL")
-    if not base_url:
-        raise SystemExit("SLACK_BASE_URL is not set")
-    client = SlackClient(xoxc, xoxd, base_url)
-    s3 = S3Client(
-        endpoint_url=os.environ.get("S3_ENDPOINT"),
-        aws_access_key_id=os.environ.get("S3_ACCESS_KEY", ""),
-        aws_secret_access_key=os.environ.get("S3_SECRET_KEY", ""),
-        bucket_name=os.environ.get("S3_BUCKET", "cortex-slack-files"),
-    )
+    client, s3, xoxc, xoxd = _build_clients(conn)
 
     def _session_is_valid() -> bool:
-        """Ask Slack directly rather than inferring from file responses."""
+        """Ask Slack directly rather than inferring from file responses.
+
+        Only SlackAuthError is proof the credential is gone; _post raises it for
+        exactly the four codes that mean that. A rate limit surviving five
+        retries, a DNS blip, a 503 -- those are "cannot confirm", and reporting
+        them as "confirmed dead" turned a transient network fault into a
+        shutdown. Unknown is treated as alive: the cost of being wrong that way
+        is a few more sign-in pages, against a stopped worker and lost files.
+        """
         try:
             client._post("auth.test", {})
-        except Exception:  # noqa: BLE001 - any failure here means "cannot confirm"
+        except SlackAuthError:
             return False
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("cannot confirm session health; assuming alive", error=str(exc))
+            return True
         return True
 
     total = 0

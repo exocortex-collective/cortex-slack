@@ -12,6 +12,7 @@ succeed. Transient means the world was briefly unavailable.
 
 from __future__ import annotations
 
+import http.client
 import random
 import urllib.error
 from dataclasses import dataclass
@@ -24,8 +25,16 @@ from enum import StrEnum
 # attempts before anyone noticed.
 RETRYABLE_STATUS = frozenset({429})
 
+# Authorization failures. Scoped to the credential rather than the request, so a
+# refreshed token changes the answer -- which makes them retryable, not terminal.
+SESSION_SCOPED_STATUS = frozenset({401, 403})
+
 FIRST_DELAY = timedelta(minutes=1)
-MAX_DELAY = timedelta(hours=6)
+# Reachable on purpose. With MAX_ATTEMPTS = 6 and doubling from one minute the
+# largest delay is 1 * 2**4 = 16 minutes, so a six-hour cap was unreachable and
+# the docstring describing it was simply wrong. Capping at the value the budget
+# actually produces keeps the two honest.
+MAX_DELAY = timedelta(minutes=16)
 MAX_ATTEMPTS = 6
 
 # Spread retries that failed together so they do not return together. Without
@@ -55,13 +64,34 @@ def classify(exc: BaseException) -> Decision:
     if isinstance(exc, urllib.error.HTTPError):
         if exc.code in RETRYABLE_STATUS:
             return Decision(Disposition.TRANSIENT, f"HTTP {exc.code}")
+        if exc.code in SESSION_SCOPED_STATUS:
+            # Not terminal: the premise of phase 1 is that the session token
+            # expires and is replaced by hand, so "this session cannot have it"
+            # is not a permanent fact about the file. Marking these terminal
+            # abandoned 35 files that a fresh token would fetch.
+            return Decision(Disposition.TRANSIENT, f"HTTP {exc.code}")
         if 400 <= exc.code < 500:
             return Decision(Disposition.TERMINAL, f"HTTP {exc.code}")
         # 5xx and anything else the server said: the server is having a
         # problem, which is the definition of transient.
         return Decision(Disposition.TRANSIENT, f"HTTP {exc.code}")
 
-    if isinstance(exc, TimeoutError | urllib.error.URLError | ConnectionError):
+    if isinstance(
+        exc,
+        TimeoutError | urllib.error.URLError | ConnectionError | http.client.HTTPException,
+    ):
+        # http.client.HTTPException is NOT an OSError -- it descends straight
+        # from Exception -- so the broad clause below never caught it. download()
+        # calls response.read() inside the urlopen context and urllib does not
+        # wrap read-time failures, so IncompleteRead (connection dropped
+        # mid-body), BadStatusLine and LineTooLong arrived here raw, fell past
+        # every check, and were classified TERMINAL. A truncated read is the most
+        # likely failure for a 200MB ceiling over a CDN, and it was permanently
+        # abandoning the file.
+        #
+        # RemoteDisconnected happens to be safe because it multiply-inherits
+        # ConnectionResetError, which is exactly what made the gap survive a
+        # spot check.
         return Decision(Disposition.TRANSIENT, type(exc).__name__)
 
     if isinstance(exc, OSError):
@@ -81,10 +111,11 @@ def classify(exc: BaseException) -> Decision:
 def next_attempt_at(attempts: int, *, now: datetime | None = None) -> datetime | None:
     """When a failure that has been tried `attempts` times may be tried again.
 
-    None means the budget is spent. Doubling from one minute, capped at six
-    hours: long enough that a retry samples a genuinely different moment, short
-    enough that a file whose channel was briefly unreachable is not abandoned
-    for a day.
+    None means the budget is spent. Doubling from one minute across six
+    attempts, so the last wait is sixteen minutes and the whole budget spans
+    about half an hour: long enough that each retry samples a genuinely
+    different moment, short enough that a file whose channel was briefly
+    unreachable is not abandoned for a day.
     """
     if attempts >= MAX_ATTEMPTS:
         return None

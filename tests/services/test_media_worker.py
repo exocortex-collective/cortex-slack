@@ -120,11 +120,15 @@ def test_a_sign_in_page_is_never_stored_as_if_it_were_the_file(
     )
     s3 = _FakeS3()
 
-    stored, _failed, _selected = store_pending(clean, s3, "xoxc", "xoxd")
+    stored, failed, _selected = store_pending(clean, s3, "xoxc", "xoxd")
 
     assert stored == 0
     assert s3.objects == {}, "wrote a sign-in page into the bucket"
-    assert _pending(clean) == 0, "left it pending, so it will be re-fetched forever"
+    # Retried, not tombstoned: a sign-in page is a fact about the credential,
+    # not about the file, and the token is replaced by hand in phase 1. Marking
+    # it terminal abandoned 31 files a fresh token would have fetched.
+    assert failed == 1
+    assert _fetch_error(clean, "F1") is None, "abandoned a file for a credential problem"
 
 
 def test_credentials_rejected_is_not_an_oserror() -> None:
@@ -189,7 +193,7 @@ def _http_error(code: int) -> urllib.error.HTTPError:
     return urllib.error.HTTPError("https://x", code, "nope", {}, None)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("code", [401, 403, 404, 410])
+@pytest.mark.parametrize("code", [404, 410])
 def test_a_permanently_dead_file_stops_being_pending(
     clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch, code: int
 ) -> None:
@@ -335,7 +339,6 @@ def test_one_sign_in_page_does_not_stop_the_run(
 
     assert stored == 2, "one odd file stopped the other two"
     assert selected == 3
-    assert _fetch_error(clean, "F0") is not None and "sign-in page" in _fetch_error(clean, "F0")
 
 
 def test_a_run_of_sign_in_pages_stops_only_if_the_session_is_really_dead(
@@ -378,8 +381,7 @@ def test_a_run_of_sign_in_pages_continues_when_the_session_is_valid(
     )
 
     assert selected == 8, "stopped a run whose session was confirmed healthy"
-    assert stored == 0 and failed == 0
-    assert _pending(clean) == 0, "all eight should be marked, not left to retry forever"
+    assert stored == 0
 
 
 def test_the_session_is_only_checked_after_a_run_of_failures(
