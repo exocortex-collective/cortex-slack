@@ -43,23 +43,22 @@ BATCH_SIZE = 2000
 # With the keyset the index scan starts where the last batch stopped, so a pass
 # over the table costs one scan rather than one per batch.
 _PENDING = """
-SELECT r.channel_id, r.ts, r.raw
+SELECT r.channel_id, r.ts, r.raw, r.fetched_at
   FROM slack_messages_raw r
   LEFT JOIN slack_messages m ON m.channel_id = r.channel_id AND m.ts = r.ts
- -- Unparsed, OR parsed before the raw row was last refetched. The second half
- -- was missing: ingest goes to real trouble to detect a changed message and
- -- return UPDATED, and that outcome stopped at the raw tier. Measured live --
- -- 11 rows whose raw carried an edited_ts their parsed row did not, each
- -- parsed about ten minutes before the edit arrived, and nothing would ever
- -- have revisited them. The ON CONFLICT DO UPDATE below was written for this
- -- case and was unreachable.
+ -- Unparsed, OR parsed from a different raw version than the one held now.
+ -- The second half was missing: ingest goes to real trouble to detect a
+ -- changed message and return UPDATED, and that outcome stopped at the raw
+ -- tier. Measured live -- 11 rows whose raw carried an edited_ts their parsed
+ -- row did not, and nothing would ever have revisited them.
  --
- -- It matters far more since reply_count began triggering a rewrite: that
- -- happens every time a reply lands on a thread parent, so text, reactions and
- -- tags would go stale for every active thread.
- --
- -- Both timestamps are server NOW(), so this compares one clock.
- WHERE (m.ts IS NULL OR m.parsed_at < r.fetched_at)
+ -- Version, not time. "parsed_at < fetched_at" compared two transaction-start
+ -- clocks, and the poller's transaction spans a whole channel: a row rewritten
+ -- late in it carries a fetched_at from its start, so a parse that ran in
+ -- between looked newer than the rewrite and the row read as current forever.
+ -- parsed_from is the fetched_at the parser read; a rewrite in any other
+ -- transaction changes it, whichever way the clocks fell.
+ WHERE (m.ts IS NULL OR m.parsed_from IS DISTINCT FROM r.fetched_at)
    AND (r.channel_id, r.ts) > (%s, %s)
  ORDER BY r.channel_id, r.ts
  LIMIT %s
@@ -102,7 +101,7 @@ def parse_batch(
 
     written = 0
     with conn.cursor() as cur:
-        for channel_id, ts, raw in rows:
+        for channel_id, ts, raw, fetched_at in rows:
             try:
                 values = _row_for(channel_id, ts, raw)
             except Exception as exc:  # noqa: BLE001
@@ -115,8 +114,8 @@ def parse_batch(
                 """
                 INSERT INTO slack_messages
                     (channel_id, ts, thread_ts, user_id, subtype, text, blocks,
-                     reactions, reply_count, edited_at, posted_at, tags)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     reactions, reply_count, edited_at, posted_at, tags, parsed_from)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (channel_id, ts) DO UPDATE
                    SET thread_ts = EXCLUDED.thread_ts,
                        user_id = EXCLUDED.user_id,
@@ -128,9 +127,10 @@ def parse_batch(
                        edited_at = EXCLUDED.edited_at,
                        posted_at = EXCLUDED.posted_at,
                        tags = EXCLUDED.tags,
+                       parsed_from = EXCLUDED.parsed_from,
                        parsed_at = NOW()
                 """,
-                values,
+                (*values, fetched_at),
             )
             written += 1
     conn.commit()

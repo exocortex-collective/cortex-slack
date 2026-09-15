@@ -312,7 +312,15 @@ def _finish(
                 """
                 INSERT INTO slack_sync_state (channel_id, last_ts, last_synced_at, last_error)
                 SELECT %s, MAX(ts), NOW(), NULL
-                  FROM slack_messages_raw WHERE channel_id = %s
+                  FROM slack_messages_raw
+                 WHERE channel_id = %s
+                   -- Top-level messages only. Page 1 is read at the job's start,
+                   -- so no top-level message newer than that is in scope -- but
+                   -- thread walks run later and ingest replies posted since. A
+                   -- MAX over replies landed on one of those, and the poller
+                   -- then started above every top-level message between the
+                   -- scan's start and that reply: a silent, permanent gap.
+                   AND (thread_ts IS NULL OR thread_ts = ts)
                 ON CONFLICT (channel_id) DO UPDATE
                    -- Never backwards, and NULL-safe: EXCLUDED.last_ts is MAX(ts)
                    -- over the channel's raw rows, which is NULL when a re-scan

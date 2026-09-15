@@ -143,6 +143,29 @@ def test_a_truncated_read_is_transient() -> None:
     assert classify(http.client.BadStatusLine("garbage")).disposition is Disposition.TRANSIENT
 
 
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+def test_a_refused_redirect_is_session_scoped(code: int) -> None:
+    """files.slack.com bounces an unauthenticated request to the sign-in page.
+
+    The media worker refuses to follow it, so the bounce arrives as an
+    HTTPError. Classified TRANSIENT it spent the file's budget on the session's
+    problem and abandoned the file -- round 3's finding, re-created by the fix
+    for the credential leak.
+    """
+    exc = urllib.error.HTTPError(
+        "https://files.slack.com/f/F1/x",
+        code,
+        "Found",
+        {"Location": "https://valideval.slack.com/?redir=%2Ffiles-pri%2F"},  # type: ignore[arg-type]
+        None,
+    )
+
+    decision = classify(exc)
+
+    assert decision.disposition is Disposition.SESSION
+    assert "valideval.slack.com" in decision.reason, "the redirect target belongs in the log"
+
+
 @pytest.mark.parametrize("code", [401, 403])
 def test_authorization_failures_are_session_scoped(code: int) -> None:
     """Not terminal, and not transient either.

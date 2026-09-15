@@ -464,3 +464,52 @@ def test_one_failed_reply_does_not_take_the_thread_or_the_watermark_with_it(
         "the savepoint did not isolate the failure: neighbouring replies were lost"
     )
     assert _watermark(clean) is None, "watermark advanced past an unstored reply"
+
+
+def _recent_ts(seconds_ago: int, micros: str = "000001") -> str:
+    import time
+
+    return f"{int(time.time()) - seconds_ago:010d}.{micros}"
+
+
+def test_the_sweep_does_not_walk_a_thread_by_its_replies(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """A reply is a recent human message too, and nothing said "parent".
+
+    Measured live: 101 of 636 human messages in a week were replies, so a sixth
+    of the sweep budget re-fetched threads the parent row already covered --
+    and stamped thread_swept_at on reply rows, which is meant to stay NULL.
+    """
+    _channel(clean)
+    parent, reply = _recent_ts(3600), _recent_ts(1800)
+    _parent(clean, parent, replies=1)
+    from cortex_slack.ingest import ingest_message
+
+    ingest_message(clean, C1, _msg(reply, thread_ts=parent), source="poll", enqueue_parse=False)
+    clean.commit()
+    client = _ThreadClient({parent: [_msg(reply, thread_ts=parent)]})
+
+    poll_once(clean, client)  # type: ignore[arg-type]
+
+    assert client.walked == [parent], f"walked by a reply's ts: {client.walked}"
+
+
+def test_a_thread_walked_in_the_channel_pass_is_not_swept_again_the_same_pass(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """The channel pass walks a new thread; the sweep runs minutes later.
+
+    Without the channel pass stamping thread_swept_at, the parent is recent and
+    unswept when the sweep looks, and the same thread costs two requests.
+    """
+    _channel(clean)
+    parent = _recent_ts(600)
+    reply = _msg(_recent_ts(300), thread_ts=parent)
+    client = _ThreadClient(
+        {parent: [reply]}, messages=[_msg(parent, thread_ts=parent, reply_count=1)]
+    )
+
+    poll_once(clean, client)  # type: ignore[arg-type]
+
+    assert client.walked == [parent], f"walked twice in one pass: {client.walked}"

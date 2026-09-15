@@ -94,6 +94,11 @@ SELECT p.channel_id, p.ts
          -- its count refreshes.
          (to_timestamp(split_part(p.ts, '.', 1)::bigint) > NOW() - %s::interval
           AND (p.thread_swept_at IS NULL OR p.thread_swept_at < NOW() - %s::interval)
+          -- Parents only. A reply is a human message inside the window too,
+          -- and walking a thread by a reply's ts spent a sixth of the sweep
+          -- budget re-fetching threads the parent row already covers. (No
+          -- percent sign in this string: psycopg2 reads one as a placeholder.)
+          AND (p.thread_ts IS NULL OR p.thread_ts = p.ts)
           AND (p.reply_count > 0
                OR m.tags IS NULL
                OR NOT (m.tags && ARRAY['automated', 'system'])))
@@ -221,13 +226,17 @@ def sweep_threads(
             # which window the next pass scans. Stamping it after a walk whose
             # replies did not all land restarts the six-hour timer over an
             # incomplete thread.
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE slack_messages_raw SET thread_swept_at = NOW() "
-                    "WHERE channel_id = %s AND ts = %s",
-                    (channel_id, thread_ts),
-                )
+            _mark_swept(conn, channel_id, thread_ts)
         conn.commit()
+
+
+def _mark_swept(conn: psycopg2.extensions.connection, channel_id: str, thread_ts: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE slack_messages_raw SET thread_swept_at = NOW() "
+            "WHERE channel_id = %s AND ts = %s",
+            (channel_id, thread_ts),
+        )
 
 
 def _poll_channel(
@@ -281,6 +290,10 @@ def _poll_channel(
             )
             stats.replies += ingested
             channel_errors += failed
+            if failed == 0:
+                # Otherwise the sweep at the end of this same pass selects the
+                # parent again -- it is recent and unswept -- and walks it twice.
+                _mark_swept(conn, channel_id, str(message["ts"]))
 
         if isinstance(ts, str) and (newest_seen is None or ts > newest_seen):
             # String comparison is correct here: every Slack ts is exactly ten

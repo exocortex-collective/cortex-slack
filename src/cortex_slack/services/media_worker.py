@@ -89,6 +89,19 @@ class NoRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _open(request: urllib.request.Request, timeout: int) -> Any:
+    """The opener download() uses: one that refuses redirects.
+
+    Its own function so a test can aim it at a real server that bounces. The
+    first redirect test asserted that a handler method returned None, which
+    proved nothing about what download() did with it -- and a fix that swapped
+    the opener would have passed it.
+    """
+    return urllib.request.build_opener(NoRedirects).open(  # nosec B310 - host allowlisted by caller
+        request, timeout=timeout
+    )
+
+
 class FileTooLarge(RuntimeError):
     """The file exceeds the size ceiling.
 
@@ -252,9 +265,11 @@ def download(url: str, xoxc: str, xoxd: str, timeout: int = 120) -> bytes:
 
     Needs BOTH credentials: the bearer token authorizes the API, and the d
     cookie authorizes the file endpoint, which is a different host path with its
-    own auth. Sending only the token returns an HTML sign-in page with status
-    200 -- not an error, just the wrong bytes, silently stored as if it were the
-    file.
+    own auth. Without the cookie files.slack.com answers with a 302 to the
+    sign-in page; because redirects are refused below, that surfaces as an
+    HTTPError and classify() calls it session-scoped. The text/html check at
+    the bottom is the backstop for a sign-in page served directly with a 200,
+    which is what the endpoint did before and may do again.
     """
     # The HOST is checked, not just the scheme. This URL is payload data, and the
     # credentials below are the session for the entire workspace -- so the
@@ -268,8 +283,7 @@ def download(url: str, xoxc: str, xoxd: str, timeout: int = 120) -> bytes:
         url,
         headers={"Authorization": f"Bearer {xoxc}", "Cookie": f"d={xoxd}"},
     )
-    opener = urllib.request.build_opener(NoRedirects)
-    with opener.open(request, timeout=timeout) as response:  # nosec B310
+    with _open(request, timeout) as response:
         content_type = response.headers.get("Content-Type", "")
         data: bytes = response.read(MAX_BYTES + 1)
 

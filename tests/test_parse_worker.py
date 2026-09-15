@@ -95,3 +95,52 @@ def test_an_empty_batch_does_not_leave_a_transaction_open(
     assert clean.status == psycopg2.extensions.STATUS_READY, (
         "left a transaction open after finding no work"
     )
+
+
+def test_a_rewrite_from_an_older_transaction_is_still_reparsed(
+    clean: psycopg2.extensions.connection, dsn: str
+) -> None:
+    """NOW() is pinned at transaction start, and the poller's spans a channel.
+
+    A raw row rewritten late in that transaction carries a fetched_at from its
+    start. If the parser ran in between, "parsed_at < fetched_at" was false
+    forever: raw text v2, parsed text v1, and nothing would revisit it. Version
+    the parse instead -- record the fetched_at that was read, and re-parse
+    whenever the raw row no longer carries it.
+    """
+    _ingest(clean, "C1", "1725379200.000001", text="v1")
+    # The poller's long transaction begins: NOW() is frozen here.
+    with clean.cursor() as cur:
+        cur.execute("SELECT 1")
+
+    parser = psycopg2.connect(dsn)
+    try:
+        written, _ = parse_batch(parser)
+        assert written == 1
+
+        # The rewrite lands inside the older transaction, so its fetched_at is
+        # earlier than the parse that just happened.
+        ingest_message(
+            clean,
+            "C1",
+            {
+                "type": "message",
+                "ts": "1725379200.000001",
+                "user": "U1",
+                "text": "v2",
+                "edited": {"ts": "1725379300.000000", "user": "U1"},
+            },
+            source="poll",
+            enqueue_parse=False,
+        )
+        clean.commit()
+
+        written, _ = parse_batch(parser)
+        with parser.cursor() as cur:
+            cur.execute("SELECT text FROM slack_messages WHERE ts = '1725379200.000001'")
+            row = cur.fetchone()
+    finally:
+        parser.close()
+
+    assert written == 1, "the rewrite was invisible to the work predicate"
+    assert row is not None and row[0] == "v2"

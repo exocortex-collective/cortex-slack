@@ -572,3 +572,24 @@ def test_rescanning_an_empty_channel_keeps_its_watermark(
     assert result is not None and result.clean
     assert _job(clean, C1)[0] == "done"
     assert _watermark(clean, C1) == "1725379200.000001", "an empty re-scan nulled the watermark"
+
+
+def test_the_watermark_is_the_newest_top_level_message_not_the_newest_reply(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """Page 1 fixes what the job can see; thread walks ingest replies posted after it.
+
+    A MAX(ts) over everything landed on such a reply, and the poller then began
+    above every top-level message posted between the scan's start and that
+    reply -- a silent, permanent gap.
+    """
+    parent = _msg("1725379200.000001", thread_ts="1725379200.000001", reply_count=1)
+    late_reply = _msg("1725390000.000001", thread_ts="1725379200.000001")
+    seed_jobs(clean, [{"id": C1}])
+    client = _PagedClient([[parent]], threads={"1725379200.000001": [parent, late_reply]})
+
+    result = run_next_job(clean, client)  # type: ignore[arg-type]
+
+    assert result is not None and result.clean
+    assert _stored(clean, C1) == [parent["ts"], late_reply["ts"]]
+    assert _watermark(clean, C1) == parent["ts"], "watermark advanced to a reply"

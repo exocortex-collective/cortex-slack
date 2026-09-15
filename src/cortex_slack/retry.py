@@ -69,6 +69,16 @@ def classify(exc: BaseException) -> Decision:
     if isinstance(exc, urllib.error.HTTPError):
         if exc.code in RETRYABLE_STATUS:
             return Decision(Disposition.TRANSIENT, f"HTTP {exc.code}")
+        if 300 <= exc.code < 400:
+            # files.slack.com does not serve its sign-in page directly: an
+            # unauthenticated request gets a 302 to it. The media worker refuses
+            # to follow redirects (following one would carry the session to
+            # whatever host it named), so that bounce arrives here as an
+            # HTTPError -- and falling through to TRANSIENT charged the file's
+            # budget for a credential problem, which is the abandonment round 3
+            # fixed, re-created by the fix for the credential leak.
+            location = exc.headers.get("Location", "?") if exc.headers else "?"
+            return Decision(Disposition.SESSION, f"HTTP {exc.code} -> {location}")
         if exc.code in SESSION_SCOPED_STATUS:
             # Its own disposition, not TRANSIENT. Calling it transient routed it
             # through the per-file retry budget -- six attempts over about half

@@ -7,12 +7,16 @@ one: storing something that is not the file.
 
 from __future__ import annotations
 
+import http.server
+import threading
 import urllib.error
+import urllib.request
 from typing import Any
 
 import psycopg2
 import pytest
 
+from cortex_slack.retry import classify
 from cortex_slack.services import media_worker
 from cortex_slack.services.media_worker import (
     CredentialsRejected,
@@ -623,11 +627,87 @@ def test_a_slack_file_url_is_allowed() -> None:
     assert called == ["https://files.slack.com/files-pri/T1-F1/x.png"]
 
 
-def test_redirects_are_refused() -> None:
+def test_a_redirect_is_surfaced_not_followed() -> None:
     """urllib carries Authorization across a cross-host redirect.
 
     Unlike requests, it does not strip auth when the host changes, so a
     files.slack.com URL that 302s off-domain would hand the session to wherever
-    it pointed -- defeating the allowlist entirely.
+    it pointed -- defeating the allowlist entirely. Against a real server that
+    redirects: the opener must raise rather than follow, and what it raises
+    must classify as the session's problem, not the file's.
     """
-    assert media_worker.NoRedirects().redirect_request(None, None, None, None, None) is None
+
+    class _Bounce(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(302)
+            self.send_header("Location", "http://127.0.0.1:1/never-contacted")
+            self.end_headers()
+
+        def log_message(self, *_a: Any) -> None:
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Bounce)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/file")
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            media_worker._open(request, 5)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert caught.value.code == 302
+    assert classify(caught.value).session_scoped
+
+
+def test_a_sign_in_redirect_is_the_sessions_problem_not_the_files(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Driven through the real download() up to the opener.
+
+    A 302 from files.slack.com must reach the run-level guard -- the
+    consecutive-sign-in counter and auth.test -- and must not spend the file's
+    attempts or mark it unfetchable. Before this, the outcome was RETRY: the
+    counter never moved, auth.test was never asked, and every pending file was
+    ground into a permanent fetch_error while the session was simply dead.
+    """
+    from cortex_slack.services.media_worker import CREDENTIAL_FAILURES_BEFORE_CHECKING
+
+    for i in range(CREDENTIAL_FAILURES_BEFORE_CHECKING):
+        _ingest_with_file(clean, f"172537920{i}.000001", _file(f"F{i}"))
+    discover_files(clean)
+
+    class _BouncingOpener:
+        def open(self, request: urllib.request.Request, timeout: float | None = None) -> Any:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                302,
+                "Found",
+                {"Location": "https://valideval.slack.com/?redir=%2Ffiles-pri%2F"},  # type: ignore[arg-type]
+                None,
+            )
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_h: _BouncingOpener())
+    asked: list[bool] = []
+
+    def _session_is_alive() -> bool:
+        asked.append(True)
+        return True
+
+    stored, failed, selected = store_pending(
+        clean, _FakeS3(), "xoxc", "xoxd", verify_session=_session_is_alive
+    )
+
+    assert (stored, failed, selected) == (0, CREDENTIAL_FAILURES_BEFORE_CHECKING, selected)
+    assert asked, "sign-in redirects never reached the session check"
+    with clean.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FILTER (WHERE attempts > 0), count(fetch_error), "
+            "count(*) FILTER (WHERE next_attempt_at > NOW()) FROM slack_files"
+        )
+        row = cur.fetchone()
+    assert row is not None
+    charged, abandoned, deferred = row
+    assert charged == 0, "a session problem was charged to the file's budget"
+    assert abandoned == 0, "a session problem marked files unfetchable"
+    assert deferred == CREDENTIAL_FAILURES_BEFORE_CHECKING
