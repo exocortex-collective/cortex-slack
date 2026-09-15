@@ -424,3 +424,77 @@ def test_a_success_resets_the_credential_failure_run(
     stored, _failed, _selected = store_pending(clean, _FakeS3(), "xoxc", "xoxd")
 
     assert stored == 4, "alternating failures were mistaken for a dead session"
+
+
+def test_a_permanently_failing_file_is_eventually_given_up_on(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ "Retryable" without a bound is a loop, not a retry policy.
+
+    Observed: 16 files answering HTTP 400 accumulated 867 download attempts
+    across restarts, sitting at the head of the queue the whole time.
+    """
+    _ingest_with_file(clean, "1725379200.000001", _file())
+    discover_files(clean)
+    monkeypatch.setattr(
+        media_worker,
+        "download",
+        lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError("reset")),
+    )
+
+    for _ in range(media_worker.MAX_ATTEMPTS):
+        store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+
+    assert _pending(clean) == 0, "retried past its budget"
+    error = _fetch_error(clean, "F1")
+    assert error is not None and "failed" in error
+
+
+def test_a_transient_failure_moves_out_of_the_queue_head(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Untried files must be reached before retries.
+
+    Ordering by fetched_at alone let a handful of persistent failures starve
+    everything behind them.
+    """
+    _ingest_with_file(clean, "1725379200.000001", _file("FBAD"))
+    _ingest_with_file(clean, "1725379200.000002", _file("FGOOD"))
+    discover_files(clean)
+    monkeypatch.setattr(
+        media_worker,
+        "download",
+        lambda *a, **k: (_ for _ in ()).throw(urllib.error.URLError("reset")),
+    )
+    store_pending(clean, _FakeS3(), "xoxc", "xoxd", limit=1)
+
+    with clean.cursor() as cur:
+        cur.execute(
+            "SELECT file_id FROM slack_files WHERE s3_key IS NULL AND fetch_error IS NULL "
+            "ORDER BY last_attempt_at NULLS FIRST, fetched_at LIMIT 1"
+        )
+        row = cur.fetchone()
+
+    assert row is not None and row[0] == "FGOOD", "the failing file still blocks the queue"
+
+
+@pytest.mark.parametrize("code", [400, 402, 405, 422])
+def test_other_client_errors_are_permanent_too(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    """Any 4xx but 429 means the request is the problem; repeating it cannot help."""
+    _ingest_with_file(clean, "1725379200.000001", _file())
+    discover_files(clean)
+    monkeypatch.setattr(
+        media_worker, "download", lambda *a, **k: (_ for _ in ()).throw(_http_error(code))
+    )
+
+    store_pending(clean, _FakeS3(), "xoxc", "xoxd")
+
+    assert _fetch_error(clean, "F1") == f"HTTP {code}"
+
+
+def test_rate_limiting_is_not_treated_as_permanent() -> None:
+    """429 is the one 4xx that a retry fixes."""
+    assert 429 not in media_worker.PERMANENT_STATUSES
+    assert 400 in media_worker.PERMANENT_STATUSES

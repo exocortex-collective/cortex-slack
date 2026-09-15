@@ -78,12 +78,15 @@ SELECT channel_id, ts, raw->'files' AS files
 """
 
 _PENDING = """
-SELECT file_id, raw
+SELECT file_id, raw, attempts
   FROM slack_files
  WHERE s3_key IS NULL
    AND fetch_error IS NULL
    AND raw->>'mode' IS DISTINCT FROM 'tombstone'
- ORDER BY fetched_at
+ -- Untried files first. Ordering by fetched_at alone let a handful of
+ -- persistently failing files sit at the head of the queue and starve
+ -- everything behind them.
+ ORDER BY last_attempt_at NULLS FIRST, fetched_at
  LIMIT %s
 """
 
@@ -91,7 +94,15 @@ SELECT file_id, raw
 # gone from Slack; 401 and 403 mean this session cannot have it, which for a
 # session-scoped credential is not going to change by asking again. Everything
 # else -- timeouts, 5xx, connection resets -- is transient and stays pending.
-PERMANENT_STATUSES = frozenset({401, 403, 404, 410})
+# Client-error statuses that will never succeed on a retry. Any 4xx except 429
+# qualifies: the request itself is the problem, and repeating it unchanged
+# cannot fix that. 400 was the omission that mattered -- 16 files answering it
+# accumulated 867 attempts before this was noticed.
+PERMANENT_STATUSES = frozenset(range(400, 429)) | frozenset(range(430, 500))
+
+# How many times a transient failure is retried before the file is given up on.
+# "Retryable" without a bound is not a retry policy, it is a loop.
+MAX_ATTEMPTS = 5
 
 # How many files in a row must answer with a sign-in page before the session is
 # CHECKED. Not before it is presumed dead -- inferring session health from file
@@ -228,7 +239,7 @@ def store_pending(
 
     stored = failed = 0
     consecutive_html = 0
-    for file_id, raw in rows:
+    for file_id, raw, attempts in rows:
         url = raw.get("url_private_download") or raw.get("url_private")
         if not url:
             # No URL at all: nothing to fetch, ever. Left pending would make it
@@ -274,7 +285,13 @@ def store_pending(
             continue
         except (urllib.error.URLError, OSError, ValueError) as exc:
             failed += 1
-            logger.warning("file download failed", file_id=file_id, error=str(exc))
+            _record_attempt(conn, file_id, attempts + 1, str(exc))
+            logger.warning(
+                "file download failed",
+                file_id=file_id,
+                attempt=attempts + 1,
+                error=str(exc),
+            )
             continue
 
         consecutive_html = 0
@@ -288,6 +305,26 @@ def store_pending(
         conn.commit()
         stored += 1
     return stored, failed, len(rows)
+
+
+def _record_attempt(
+    conn: psycopg2.extensions.connection, file_id: str, attempts: int, why: str
+) -> None:
+    """Count a transient failure, and give up once the budget is spent.
+
+    Touching last_attempt_at is what moves the row out of the head of the work
+    queue, so a failing file stops blocking the ones behind it even before its
+    attempts run out.
+    """
+    if attempts >= MAX_ATTEMPTS:
+        _mark_unfetchable(conn, file_id, f"failed {attempts} times, last: {why[:200]}")
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE slack_files SET attempts = %s, last_attempt_at = NOW() WHERE file_id = %s",
+            (attempts, file_id),
+        )
+    conn.commit()
 
 
 def _mark_unfetchable(conn: psycopg2.extensions.connection, file_id: str, why: str) -> None:
