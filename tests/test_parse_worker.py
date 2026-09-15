@@ -144,3 +144,26 @@ def test_a_rewrite_from_an_older_transaction_is_still_reparsed(
 
     assert written == 1, "the rewrite was invisible to the work predicate"
     assert row is not None and row[0] == "v2"
+
+
+def test_a_row_parsed_before_versioning_existed_is_reversioned_once(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """Rows from before 009 carry parsed_from NULL; the worker, not a migration, stamps them.
+
+    Migration 009 deliberately does not backfill -- that rewrite under the boot
+    transaction's locks was measured at minutes -- so 1.55M production rows
+    depend on NULL being distinct from every fetched_at. A predicate written
+    with <> would leave this suite green and never re-version any of them.
+    """
+    _ingest(clean, "C1", "1725379200.000001")
+    parse_batch(clean)
+    with clean.cursor() as cur:
+        cur.execute("UPDATE slack_messages SET parsed_from = NULL")
+    clean.commit()
+
+    written, _ = parse_batch(clean)
+    assert written == 1, "a legacy NULL parsed_from row was not re-versioned"
+
+    written, _ = parse_batch(clean)
+    assert written == 0, "re-versioning did not stamp parsed_from"

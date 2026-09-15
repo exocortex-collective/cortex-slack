@@ -17,8 +17,15 @@
 -- parsed row -- 1,553,283 in production, a hash join of two seq scans and a
 -- non-HOT rewrite of a 291MB heap plus five indexes -- inside the single boot
 -- transaction that holds ACCESS EXCLUSIVE on three tables, for minutes, with
--- no lock_timeout anywhere. The parse worker does the same work for free:
--- NULL is distinct from every fetched_at, so it re-versions existing rows in
--- committed 2,000-row batches with no DDL lock held, about seven minutes of
--- parse CPU once, and nothing to re-scan on later boots.
+-- no lock_timeout anywhere. The parse worker does the same rewrite without
+-- the lock: NULL is distinct from every fetched_at, so it re-versions existing
+-- rows in committed 2,000-row batches, about seven minutes of parse CPU once.
+-- It is the same 1.55M non-HOT tuple versions across the heap and five
+-- indexes -- expect the table to roughly double until autovacuum reclaims
+-- it -- but no reader waits on it, and nothing re-scans on later boots.
 ALTER TABLE slack_messages ADD COLUMN IF NOT EXISTS parsed_from TIMESTAMPTZ;
+
+-- An earlier revision of this file created a partial index to serve a
+-- per-boot re-scan that no longer exists. A no-op everywhere but a database
+-- that ran that revision, and a lone DROP IF EXISTS does not rebuild anything.
+DROP INDEX IF EXISTS idx_slack_messages_unversioned;
