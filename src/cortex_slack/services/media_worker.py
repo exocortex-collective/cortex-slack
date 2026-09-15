@@ -85,7 +85,7 @@ class NoRedirects(urllib.request.HTTPRedirectHandler):
     it pointed, defeating the allowlist above.
     """
 
-    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
         return None
 
 
