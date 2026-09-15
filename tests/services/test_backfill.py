@@ -405,9 +405,9 @@ def test_thread_replies_are_counted_in_the_total(
     result = run_next_job(clean, client)  # type: ignore[arg-type]
 
     assert result is not None
-    assert result.seen == len(
-        _stored(clean, C1)
-    ), f"reported {result.seen} but stored {len(_stored(clean, C1))}"
+    assert result.seen == len(_stored(clean, C1)), (
+        f"reported {result.seen} but stored {len(_stored(clean, C1))}"
+    )
 
 
 def test_a_failed_message_does_not_discard_the_rest_of_its_page(
@@ -538,6 +538,6 @@ def test_a_thread_broadcast_is_not_counted_twice(
     result = run_next_job(clean, client)  # type: ignore[arg-type]
 
     assert result is not None
-    assert result.seen == len(
-        _stored(clean, C1)
-    ), f"reported {result.seen} but stored {len(_stored(clean, C1))}"
+    assert result.seen == len(_stored(clean, C1)), (
+        f"reported {result.seen} but stored {len(_stored(clean, C1))}"
+    )

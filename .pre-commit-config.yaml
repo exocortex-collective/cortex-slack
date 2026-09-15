@@ -1,6 +1,11 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.6.9
+    # MUST match the ruff in uv.lock. At v0.6.9 against the project's 0.16.6,
+    # the two disagreed about wrapping `assert x, (...)`: every commit was
+    # formatted by the venv's ruff, silently reformatted back by this hook, and
+    # then failed `ruff format --check` in CI, which uses the locked version.
+    # Twenty consecutive red runs, unwinnable until the versions agree.
+    rev: v0.16.6
     hooks:
       - id: ruff
         args: [--fix]

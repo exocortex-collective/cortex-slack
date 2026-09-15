@@ -92,6 +92,6 @@ def test_an_empty_batch_does_not_leave_a_transaction_open(
     written, next_key = parse_batch(clean)
 
     assert (written, next_key) == (0, None)
-    assert (
-        clean.status == psycopg2.extensions.STATUS_READY
-    ), "left a transaction open after finding no work"
+    assert clean.status == psycopg2.extensions.STATUS_READY, (
+        "left a transaction open after finding no work"
+    )
