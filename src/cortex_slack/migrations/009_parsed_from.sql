@@ -12,17 +12,13 @@
 -- predicate asks whether the raw row still carries that value. A rewrite in
 -- any other transaction changes fetched_at, and equality does not care which
 -- of two timestamps is larger.
+--
+-- Just the column, deliberately. A backfill UPDATE here would rewrite every
+-- parsed row -- 1,553,283 in production, a hash join of two seq scans and a
+-- non-HOT rewrite of a 291MB heap plus five indexes -- inside the single boot
+-- transaction that holds ACCESS EXCLUSIVE on three tables, for minutes, with
+-- no lock_timeout anywhere. The parse worker does the same work for free:
+-- NULL is distinct from every fetched_at, so it re-versions existing rows in
+-- committed 2,000-row batches with no DDL lock held, about seven minutes of
+-- parse CPU once, and nothing to re-scan on later boots.
 ALTER TABLE slack_messages ADD COLUMN IF NOT EXISTS parsed_from TIMESTAMPTZ;
-
--- Rows the old predicate called current adopt the version they hold now. Rows
--- it already owed a re-parse stay NULL and are picked up by the worker. Only
--- ever a full scan once: the partial index below serves the re-run.
-UPDATE slack_messages m
-   SET parsed_from = r.fetched_at
-  FROM slack_messages_raw r
- WHERE r.channel_id = m.channel_id AND r.ts = m.ts
-   AND m.parsed_from IS NULL
-   AND m.parsed_at >= r.fetched_at;
-
-CREATE INDEX IF NOT EXISTS idx_slack_messages_unversioned
-    ON slack_messages (channel_id, ts) WHERE parsed_from IS NULL;
