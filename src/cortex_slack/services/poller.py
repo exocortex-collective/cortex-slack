@@ -45,9 +45,46 @@ SELECT c.channel_id, c.name, s.last_ts
 """
 
 
+# How long a thread keeps attracting replies. Threads older than this are swept
+# only when they are demonstrably short, not on a schedule -- a two-month-old
+# conversation is not going to gain a reply, and sweeping it spends a
+# rate-limited request to confirm that.
+THREAD_ACTIVE_WINDOW = "7 days"
+
+# How often an active thread is re-checked, and how many to sweep per pass. The
+# cap matters: a full pass is already 315s of the 300s interval, so an unbounded
+# sweep would push the poller further behind on every cycle.
+THREAD_RESWEEP_AFTER = "6 hours"
+THREAD_SWEEP_LIMIT = 40
+
+# Parents whose replies may be missing. Two populations, and the first is the
+# one that self-corrects: a thread storing fewer replies than Slack claimed is
+# provably incomplete regardless of age. The second is recency -- an active
+# thread gains replies that no channel read will ever surface, because a reply
+# does not change its parent's ts.
+_STALE_THREADS = """
+SELECT p.channel_id, p.ts
+  FROM slack_messages_raw p
+ WHERE (p.raw->>'reply_count')::int > 0
+   AND (
+         (SELECT count(*) FROM slack_messages_raw r
+           WHERE r.channel_id = p.channel_id
+             AND r.raw->>'thread_ts' = p.ts
+             AND r.ts <> p.ts) < (p.raw->>'reply_count')::int
+      OR (
+           to_timestamp(split_part(p.ts, '.', 1)::bigint) > NOW() - %s::interval
+           AND (p.thread_swept_at IS NULL OR p.thread_swept_at < NOW() - %s::interval)
+         )
+       )
+ ORDER BY p.thread_swept_at NULLS FIRST, p.ts DESC
+ LIMIT %s
+"""
+
+
 @dataclass
 class PollStats:
     channels: int = 0
+    swept_threads: int = 0
     stored: int = 0
     updated: int = 0
     unchanged: int = 0
@@ -107,7 +144,52 @@ def poll_once(
             stats.failed_channels.append(name or channel_id)
             _record_error(conn, channel_id, str(exc))
             logger.warning("channel poll failed", channel=name or channel_id, error=str(exc))
+
+    sweep_threads(conn, client, stats)
     return stats
+
+
+def sweep_threads(
+    conn: psycopg2.extensions.connection, client: SlackClient, stats: PollStats
+) -> None:
+    """Re-read threads a channel scan can never surface.
+
+    Walking threads for parents seen in the current pass covers new threads and
+    nothing else: a reply does not change its parent's ts, so an older parent
+    sinks below the watermark and its thread is frozen at whatever was stored
+    the last time the parent happened to be read.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            _STALE_THREADS, (THREAD_ACTIVE_WINDOW, THREAD_RESWEEP_AFTER, THREAD_SWEEP_LIMIT)
+        )
+        threads = cur.fetchall()
+    conn.rollback()
+
+    for channel_id, thread_ts in threads:
+        try:
+            ingested, failed = walk_thread(conn, client, channel_id, thread_ts, source=SOURCE)
+        except SlackAuthError:
+            raise
+        except SlackError as exc:
+            # One unreadable thread must not end the sweep.
+            stats.errors += 1
+            logger.warning(
+                "thread sweep failed", channel=channel_id, thread_ts=thread_ts, error=str(exc)
+            )
+            conn.rollback()
+            continue
+
+        stats.stored += ingested
+        stats.errors += failed
+        stats.swept_threads += 1
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE slack_messages_raw SET thread_swept_at = NOW() "
+                "WHERE channel_id = %s AND ts = %s",
+                (channel_id, thread_ts),
+            )
+        conn.commit()
 
 
 def _poll_channel(

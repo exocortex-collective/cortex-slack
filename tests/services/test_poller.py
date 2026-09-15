@@ -198,3 +198,107 @@ def test_the_overlap_preserves_the_sub_second_half() -> None:
 
 def test_the_overlap_cannot_go_negative() -> None:
     assert ts_minus_seconds("0000000100.000001", 300) == "0.000001"
+
+
+# -- thread sweeping -------------------------------------------------------
+
+
+def _parent(conn: psycopg2.extensions.connection, ts: str, replies: int, channel: str = C1) -> None:
+    from cortex_slack.ingest import ingest_message
+
+    ingest_message(
+        conn,
+        channel,
+        {
+            "type": "message",
+            "ts": ts,
+            "user": "U1",
+            "text": "start",
+            "thread_ts": ts,
+            "reply_count": replies,
+        },
+        source="poll",
+        enqueue_parse=False,
+    )
+    conn.commit()
+
+
+class _ThreadClient(_Client):
+    def __init__(self, replies: dict[str, list[dict[str, Any]]] | None = None) -> None:
+        super().__init__([])
+        self._replies = replies or {}
+        self.walked: list[str] = []
+
+    def replies(self, channel: str, thread_ts: str) -> list[dict[str, Any]]:
+        self.walked.append(thread_ts)
+        return self._replies.get(thread_ts, [])
+
+
+def test_a_thread_missing_replies_is_swept_whatever_its_age(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """A reply does not change its parent's ts.
+
+    So an older parent sinks below the watermark and its thread is frozen at
+    whatever happened to be stored last time. Walking threads only for parents
+    seen in the current pass left two threads at 0 of 6 and 0 of 3, their
+    parents 95 minutes outside the overlap while a newer parent in the same
+    channel was complete.
+    """
+    _channel(clean)
+    old = "1600000000.000001"  # years old, far outside any activity window
+    _parent(clean, old, replies=2)
+    client = _ThreadClient(
+        {old: [_msg("1600000001.000001", thread_ts=old), _msg("1600000002.000001", thread_ts=old)]}
+    )
+
+    stats = poll_once(clean, client)  # type: ignore[arg-type]
+
+    assert old in client.walked, "a provably short thread was never swept"
+    assert stats.swept_threads == 1
+    assert _stored(clean) == 3
+
+
+def test_a_complete_old_thread_is_not_swept(clean: psycopg2.extensions.connection) -> None:
+    """Sweeping it spends a rate-limited request to confirm nothing changed.
+
+    A years-old conversation is not going to gain a reply.
+    """
+    _channel(clean)
+    old = "1600000000.000001"
+    _parent(clean, old, replies=1)
+    with clean.cursor() as cur:  # its one reply is already stored
+        cur.execute(
+            "INSERT INTO slack_messages_raw (channel_id, ts, source, raw) VALUES "
+            "(%s, %s, 'poll', %s)",
+            (
+                C1,
+                "1600000001.000001",
+                '{"ts": "1600000001.000001", "thread_ts": "1600000000.000001"}',
+            ),
+        )
+    clean.commit()
+
+    poll_once(clean, _ThreadClient())  # type: ignore[arg-type]
+
+    with clean.cursor() as cur:
+        cur.execute("SELECT thread_swept_at FROM slack_messages_raw WHERE ts = %s", (old,))
+        row = cur.fetchone()
+    assert row is not None and row[0] is None, "swept a complete, long-dead thread"
+
+
+def test_the_sweep_is_bounded(clean: psycopg2.extensions.connection) -> None:
+    """A full pass already takes 315s of a 300s interval.
+
+    An unbounded sweep would push the poller further behind on every cycle.
+    """
+    _channel(clean)
+    from cortex_slack.services.poller import THREAD_SWEEP_LIMIT
+
+    for i in range(THREAD_SWEEP_LIMIT + 10):
+        _parent(clean, f"16000000{i:02d}.000001", replies=1)
+    client = _ThreadClient()
+
+    poll_once(clean, client)  # type: ignore[arg-type]
+
+    assert len(client.walked) == THREAD_SWEEP_LIMIT
