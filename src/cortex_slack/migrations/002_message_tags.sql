@@ -21,8 +21,9 @@ CREATE INDEX IF NOT EXISTS idx_slack_messages_tags ON slack_messages USING GIN (
 -- firehose.
 -- Columns are named, not `m.*`.
 --
--- apply_schema() re-runs every migration on each service boot, and `m.*` is
--- expanded at creation time. The next column added to slack_messages would
+-- apply_schema() used to re-run every migration on each service boot (it now
+-- records what it has applied, but a database from before that still replays
+-- every file once), and `m.*` is expanded at creation time. The next column added to slack_messages would
 -- re-expand ahead of channel_name, and CREATE OR REPLACE VIEW may only append
 -- columns -- so Postgres would raise "cannot change name of view column", the
 -- whole concatenated DDL would abort, and all three services would fail to

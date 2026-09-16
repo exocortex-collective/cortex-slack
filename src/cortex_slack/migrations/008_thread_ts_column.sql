@@ -21,11 +21,13 @@ CREATE INDEX IF NOT EXISTS idx_slack_raw_thread
     ON slack_messages_raw (channel_id, thread_ts) WHERE thread_ts IS NOT NULL;
 
 -- Versioned name so the drop and the create are each individually a no-op on
--- re-run. apply_schema() re-executes every migration on every service boot, so
--- an unversioned DROP + CREATE IF NOT EXISTS pair can never short-circuit: the
--- drop guarantees the create has work to do, and 007 was rebuilding an index
--- over 1.55M rows on each of three containers' startups, holding ACCESS
--- EXCLUSIVE while it did.
+-- re-run. apply_schema() re-executed every migration on every service boot
+-- when this was written, so an unversioned DROP + CREATE IF NOT EXISTS pair
+-- could never short-circuit: the drop guarantees the create has work to do,
+-- and 007 was rebuilding an index over 1.55M rows on each of three containers'
+-- startups, holding ACCESS EXCLUSIVE while it did. Applied files are recorded
+-- now, but every statement stays safe to re-run: a database from before the
+-- tracking table replays them all once.
 DROP INDEX IF EXISTS idx_slack_threads_to_sweep;
 CREATE INDEX IF NOT EXISTS idx_slack_threads_to_sweep_v2
     ON slack_messages_raw (thread_swept_at NULLS FIRST, ts DESC);

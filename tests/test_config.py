@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from cortex_slack.config import dsn_from_env, schema_sql
+from typing import Any
+
+import psycopg2
+import pytest
+
+from cortex_slack import config
+from cortex_slack.config import MIGRATIONS_TABLE, apply_schema, dsn_from_env, migrations
 
 
 def test_dsn_is_a_connectable_string() -> None:
@@ -20,13 +26,120 @@ def test_dsn_is_a_connectable_string() -> None:
     assert "host=" in dsn
 
 
-def test_schema_sql_is_packaged_and_non_empty() -> None:
+def test_migrations_are_packaged_in_filename_order() -> None:
     """Read as package data, not from a repo-relative path.
 
     An installed container has no repo; cortex-granola shipped a wheel whose
     schema could not be found and only discovered it at boot.
     """
-    sql = schema_sql()
+    found = migrations()
+    names = [name for name, _ in found]
 
-    assert "CREATE TABLE IF NOT EXISTS slack_messages_raw" in sql
-    assert "CREATE TABLE IF NOT EXISTS slack_sync_state" in sql
+    assert names == sorted(names) and names[0].startswith("001_")
+    assert "CREATE TABLE IF NOT EXISTS slack_messages_raw" in found[0][1]
+    assert any("CREATE TABLE IF NOT EXISTS slack_sync_state" in sql for _, sql in found)
+
+
+def _recorded(conn: psycopg2.extensions.connection) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT name FROM {MIGRATIONS_TABLE}")
+        return {row[0] for row in cur.fetchall()}
+
+
+def test_a_migration_runs_once_and_a_new_one_runs_on_the_next_boot(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every earlier boot replayed all the DDL, exclusive locks included.
+
+    A probe migration that is not idempotent proves the file runs exactly once
+    across two boots, and a file added afterwards runs on the boot after that
+    and no earlier.
+    """
+    real = migrations()
+    probe = (
+        "900_probe.sql",
+        "CREATE TABLE slack_probe (n INT); INSERT INTO slack_probe VALUES (1);",
+    )
+    later = ("901_probe_two.sql", "INSERT INTO slack_probe VALUES (2);")
+    try:
+        monkeypatch.setattr(config, "migrations", lambda: [*real, probe])
+        apply_schema(clean)
+        apply_schema(clean)  # a second boot: CREATE TABLE without IF NOT EXISTS would raise
+
+        monkeypatch.setattr(config, "migrations", lambda: [*real, probe, later])
+        apply_schema(clean)
+
+        with clean.cursor() as cur:
+            cur.execute("SELECT n FROM slack_probe ORDER BY n")
+            rows = [r[0] for r in cur.fetchall()]
+        assert rows == [1, 2], f"a migration ran more or less than once: {rows}"
+        assert {probe[0], later[0]} <= _recorded(clean)
+        assert {name for name, _ in real} <= _recorded(clean), "the real files were not recorded"
+    finally:
+        with clean.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS slack_probe")
+            cur.execute(
+                f"DELETE FROM {MIGRATIONS_TABLE} WHERE name IN (%s, %s)", (probe[0], later[0])
+            )
+        clean.commit()
+
+
+def test_a_recorded_migration_is_not_executed_again(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The point of the ledger: a boot against a current schema runs no DDL.
+
+    The first production redeploy deadlocked apply_schema against the parse
+    worker's ordinary query, because no-op ALTERs still take ACCESS EXCLUSIVE.
+    A recorded file whose SQL cannot succeed proves it is skipped by name, not
+    re-run and tolerated.
+    """
+    poison = ("950_recorded_elsewhere.sql", "SELECT 1/0")
+    with clean.cursor() as cur:
+        cur.execute(f"INSERT INTO {MIGRATIONS_TABLE} (name) VALUES (%s)", (poison[0],))
+    clean.commit()
+    monkeypatch.setattr(config, "migrations", lambda: [*migrations(), poison])
+    try:
+        apply_schema(clean)  # raises DivisionByZero if the recorded file is executed
+    finally:
+        with clean.cursor() as cur:
+            cur.execute(f"DELETE FROM {MIGRATIONS_TABLE} WHERE name = %s", (poison[0],))
+        clean.commit()
+
+
+def test_a_deadlock_at_boot_is_retried_not_fatal(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Postgres kills one side of a deadlock; the other finishes.
+
+    Before this the killed side was the whole service, and the restart policy
+    brought it back -- the crash-loop recovery this codebase disavows.
+    """
+    real_apply = config._apply_pending
+    calls = {"n": 0}
+
+    def _deadlock_once(conn: Any) -> list[str]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise psycopg2.errors.DeadlockDetected("deadlock detected")
+        return real_apply(conn)
+
+    monkeypatch.setattr(config, "_apply_pending", _deadlock_once)
+    monkeypatch.setattr(config.time, "sleep", lambda _s: None)
+
+    apply_schema(clean)
+
+    assert calls["n"] == 2
+
+
+def test_a_deadlock_that_never_clears_is_raised(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _always(conn: Any) -> list[str]:
+        raise psycopg2.errors.DeadlockDetected("deadlock detected")
+
+    monkeypatch.setattr(config, "_apply_pending", _always)
+    monkeypatch.setattr(config.time, "sleep", lambda _s: None)
+
+    with pytest.raises(psycopg2.errors.DeadlockDetected):
+        apply_schema(clean)
