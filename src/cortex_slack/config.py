@@ -8,12 +8,33 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from importlib import resources
 
 import psycopg2
+import psycopg2.errors
 from cortex_utils.config import PostgresConfig
+from cortex_utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 SCHEMA_LOCK_NAME = "cortex_slack_schema"
+MIGRATIONS_TABLE = "slack_schema_migrations"
+
+# A boot that deadlocks with a running sibling is killed by Postgres and, before
+# this, revived by the restart policy -- the crash-loop shape this codebase
+# disavows everywhere else. Postgres kills exactly one side of a deadlock, so
+# the other proceeds and a retry here succeeds once it has finished.
+#
+# Four retries, doubling from half a second: 0.5, 1, 2, 4. The ladder is capped
+# so no single sleep approaches Docker's 10-second stop grace. time.sleep()
+# resumes across a signal (PEP 475, see run_poller.STOP_POLL_SECONDS), and the
+# handlers are installed before apply_schema runs, so a docker stop during a
+# long backoff would wait it out and then begin another replay transaction
+# only to be SIGKILLed mid-way. Harmless to data -- the transaction rolls back
+# -- but a shape this codebase has already been bitten by.
+DEADLOCK_RETRIES = 4
+DEADLOCK_FIRST_DELAY_S = 0.5
 
 # Slack's browser-session tokens. Phase 1 only: an internal Slack app replaces
 # these in phase 2 and the token file goes away with them.
@@ -45,47 +66,102 @@ def dsn_from_env() -> str:
     return dsn
 
 
-def schema_sql() -> str:
-    """The DDL this service applies at boot, read as package data.
+def migrations() -> list[tuple[str, str]]:
+    """The migration files, as (name, sql) in filename order, read as package data.
 
     Not `Path(__file__).parents[2] / "migrations"`. That walks up to a
     repo-root sibling of `src/`, which exists in a source checkout and nowhere
     else -- an installed container would raise FileNotFoundError at boot rather
     than failing at build. cortex-granola shipped exactly that bug.
 
-    Concatenated in filename order rather than applied file by file: every
-    statement is individually idempotent, so the whole string is safe to re-run,
-    and one string keeps boot a single execute rather than a loop with
-    partial-failure states.
+    The name is the identity apply_schema() records. Editing a file that has
+    already been applied does nothing anywhere it has run; a change to the
+    schema is a new file.
     """
-    migrations = resources.files("cortex_slack.migrations")
-    parts = [
-        entry.read_text(encoding="utf-8")
-        for entry in sorted(migrations.iterdir(), key=lambda e: e.name)
+    package = resources.files("cortex_slack.migrations")
+    found = [
+        (entry.name, entry.read_text(encoding="utf-8"))
+        for entry in sorted(package.iterdir(), key=lambda e: e.name)
         if entry.name.endswith(".sql")
     ]
-    if not parts:
+    if not found:
         raise RuntimeError("no .sql files packaged under cortex_slack.migrations")
-    return "\n".join(parts)
+    return found
 
 
 def apply_schema(conn: psycopg2.extensions.connection) -> None:
-    """Apply the migrations under an advisory lock, in one transaction.
+    """Apply the migrations not yet recorded, under an advisory lock, in one transaction.
 
     COMMITS. Not composable inside a larger transaction -- the lock is
     xact-scoped, so holding it open would block every other service's boot for
     as long as the caller's transaction ran.
+
+    Tracked by filename in slack_schema_migrations, so a boot against a current
+    database takes no table lock: a no-op CREATE TABLE IF NOT EXISTS on the
+    ledger, then one SELECT. It used to re-run every file on every
+    boot, and ALTER TABLE ... ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE
+    even when the column exists -- held to commit, across tables in file order.
+    A sibling worker's ordinary query locking those tables in the other order
+    deadlocked with it on the very first production redeploy, and both services
+    came back only because Docker restarted them. On a database that predates
+    the tracking table every file runs once more, exactly as before, and is
+    recorded; after that a boot runs no migration DDL.
 
     The lock is not decoration. `CREATE TABLE IF NOT EXISTS` is not safe against
     a concurrent identical CREATE: both sessions pass the existence check, and
     the loser raises DuplicateTable. Three containers boot together here.
     pg_advisory_xact_lock blocks rather than failing and releases on commit or
     rollback, so a crash mid-apply cannot strand it.
+
+    Retries a deadlock, with backoff. Postgres kills one side only; the other
+    side finishes and releases its locks, and the next attempt goes through.
     """
+    for attempt in range(DEADLOCK_RETRIES + 1):
+        try:
+            applied = _apply_pending(conn)
+        except psycopg2.errors.DeadlockDetected as exc:
+            conn.rollback()
+            if attempt == DEADLOCK_RETRIES:
+                raise
+            delay = DEADLOCK_FIRST_DELAY_S * 2**attempt
+            logger.warning(
+                "schema apply deadlocked with another session; retrying",
+                attempt=attempt + 1,
+                delay_s=delay,
+                error=str(exc).split("\n", 1)[0],
+            )
+            time.sleep(delay)
+            continue
+        if applied:
+            logger.info("schema migrations applied", migrations=applied)
+        return
+
+
+def _apply_pending(conn: psycopg2.extensions.connection) -> list[str]:
+    """One attempt: lock, find what is unrecorded, run it, record it, commit."""
     with conn.cursor() as cur:
         cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (SCHEMA_LOCK_NAME,))
-        cur.execute(schema_sql())
+        # The table name is written out rather than interpolated from
+        # MIGRATIONS_TABLE, which exists so tests can name the same table:
+        # bandit cannot tell a module constant from user input in an f-string.
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS slack_schema_migrations ("
+            "  name TEXT PRIMARY KEY,"
+            "  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+            ")"
+        )
+        cur.execute("SELECT name FROM slack_schema_migrations")
+        recorded = {row[0] for row in cur.fetchall()}
+
+        applied: list[str] = []
+        for name, sql in migrations():
+            if name in recorded:
+                continue
+            cur.execute(sql)
+            cur.execute("INSERT INTO slack_schema_migrations (name) VALUES (%s)", (name,))
+            applied.append(name)
     conn.commit()
+    return applied
 
 
 def _read_token_file(path: str) -> dict[str, str]:

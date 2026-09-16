@@ -16,7 +16,7 @@ import psycopg2
 import pytest
 from cortex_utils.queue import ensure_queue_schema
 
-from cortex_slack.config import schema_sql
+from cortex_slack.config import MIGRATIONS_TABLE, apply_schema
 
 
 @pytest.fixture(scope="session")
@@ -120,12 +120,10 @@ def schema(conn: psycopg2.extensions.connection) -> psycopg2.extensions.connecti
     Test DATA still rolls back -- only the DDL persists.
     """
     ensure_queue_schema(conn)
-    with conn.cursor() as cur:
-        # The same accessor the service uses at boot. Rebuilding a parallel
-        # path here is how the packaging bug survived: the tests proved a file
-        # the deployed code would never read.
-        cur.execute(schema_sql())
-    conn.commit()
+    # The same call the services make at boot. Rebuilding a parallel path here
+    # is how the packaging bug survived: the tests proved a file the deployed
+    # code would never read. apply_schema commits.
+    apply_schema(conn)
     return conn
 
 
@@ -144,11 +142,16 @@ def clean(schema: psycopg2.extensions.connection) -> psycopg2.extensions.connect
         # slack_sync_state, then slack_files -- and each time the failure landed
         # on an innocent test with a symptom unrelated to the cause. A list that
         # has to be maintained in step with the schema will be forgotten again.
+        # The migrations ledger is bookkeeping, not data: truncating it would
+        # make every test's apply_schema replay all the DDL, which is exactly
+        # the behaviour the ledger exists to end.
         cur.execute(
             """
             SELECT tablename FROM pg_tables
-             WHERE schemaname = 'public' AND tablename LIKE 'slack\\_%'
-            """
+             WHERE schemaname = 'public' AND tablename LIKE 'slack\\_%%'
+               AND tablename <> %s
+            """,
+            (MIGRATIONS_TABLE,),
         )
         tables = [row[0] for row in cur.fetchall()]
         assert tables, "found no slack tables to clean: the schema did not apply"

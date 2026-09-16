@@ -122,6 +122,20 @@ parse-worker and triage-worker all use.
 skip. `-p no:skipping` does not do this — it disables the skip *markers*, while a
 runtime `pytest.skip()` in a fixture sails past and the run still exits 0.
 
+## Migrations
+
+`src/cortex_slack/migrations/*.sql` are applied by `apply_schema()` at every
+service boot, once each, recorded by filename in `slack_schema_migrations`.
+A boot against a current database runs no migration DDL. Consequences:
+
+- A schema change is a **new file**. Editing a file that has already been
+  applied does nothing anywhere it has run, production included.
+- Every statement must still be safe to re-run. A database from before the
+  ledger existed replays every file once on its next boot, and the test
+  database is shared across runs.
+- The ledger is not truncated by the `clean` fixture; delete a row from it (or
+  drop the test database) to force a file to run again locally.
+
 ## Git workflow
 
 All changes go through PRs with a `pr-review-loop` to convergence. Never
