@@ -255,7 +255,12 @@ class _ThreadClient(_Client):
     def replies(self, channel: str, thread_ts: str) -> list[dict[str, Any]]:
         validate_ts(thread_ts, field="thread_ts")
         self.walked.append(thread_ts)
-        return self._replies.get(thread_ts, [])
+        if thread_ts not in self._replies:
+            # What Slack does for a message that never started a thread. The
+            # fake returned [] here, so the suite could not see that the sweep
+            # walks mostly non-parents and was counting every one as an error.
+            raise SlackError("conversations.replies", "thread_not_found")
+        return self._replies[thread_ts]
 
 
 def test_a_thread_missing_replies_is_swept_whatever_its_age(
@@ -513,3 +518,79 @@ def test_a_thread_walked_in_the_channel_pass_is_not_swept_again_the_same_pass(
     poll_once(clean, client)  # type: ignore[arg-type]
 
     assert client.walked == [parent], f"walked twice in one pass: {client.walked}"
+
+
+def test_a_recent_message_with_no_thread_is_not_an_error(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """The recency arm asks Slack about messages that may have gained a first reply.
+
+    Most never started a thread, and Slack answers thread_not_found. Measured
+    live: 275 of 279 due candidates, reported as 26 errors on a clean pass.
+    """
+    _channel(clean)
+    lonely = _recent_ts(3600)
+    from cortex_slack.ingest import ingest_message
+
+    ingest_message(clean, C1, _msg(lonely), source="poll", enqueue_parse=False)
+    clean.commit()
+    client = _ThreadClient()
+
+    stats = poll_once(clean, client)  # type: ignore[arg-type]
+
+    assert client.walked == [lonely], "the recency arm did not check it"
+    assert stats.errors == 0, "a message with no thread was counted as a failure"
+    with clean.cursor() as cur:
+        cur.execute("SELECT thread_swept_at FROM slack_messages_raw WHERE ts = %s", (lonely,))
+        row = cur.fetchone()
+    assert row is not None and row[0] is not None, "not stamped, so it sorts first on every pass"
+
+
+def test_a_first_reply_is_still_caught_after_a_thread_not_found(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """Stamping thread_not_found must not stop the re-check the arm exists for."""
+    _channel(clean)
+    parent = _recent_ts(3600)
+    from cortex_slack.ingest import ingest_message
+
+    ingest_message(clean, C1, _msg(parent), source="poll", enqueue_parse=False)
+    clean.commit()
+    poll_once(clean, _ThreadClient())  # type: ignore[arg-type]  -- thread_not_found, stamped
+
+    # Six hours pass and someone replies.
+    with clean.cursor() as cur:
+        cur.execute(
+            "UPDATE slack_messages_raw SET thread_swept_at = NOW() - interval '7 hours' "
+            "WHERE ts = %s",
+            (parent,),
+        )
+    clean.commit()
+    reply = _msg(_recent_ts(60), thread_ts=parent)
+    stats = poll_once(clean, _ThreadClient({parent: [reply]}))  # type: ignore[arg-type]
+
+    assert stats.replies == 1 and stats.errors == 0
+    assert _stored(clean) == 2, "the first reply was never fetched"
+
+
+def test_an_unreadable_thread_is_still_an_error(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only thread_not_found is benign; anything else Slack says stays a failure."""
+    _channel(clean)
+    parent = _recent_ts(3600)
+    _parent(clean, parent, replies=1)
+    client = _ThreadClient()
+    monkeypatch.setattr(
+        client,
+        "replies",
+        lambda *_a, **_k: (_ for _ in ()).throw(SlackError("conversations.replies", "fatal_error")),
+    )
+
+    stats = poll_once(clean, client)  # type: ignore[arg-type]
+
+    assert stats.errors == 1
+    with clean.cursor() as cur:
+        cur.execute("SELECT thread_swept_at FROM slack_messages_raw WHERE ts = %s", (parent,))
+        row = cur.fetchone()
+    assert row is not None and row[0] is None, "a failed walk was stamped as swept"

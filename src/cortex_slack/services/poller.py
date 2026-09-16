@@ -210,12 +210,26 @@ def sweep_threads(
         except SlackAuthError:
             raise
         except SlackError as exc:
+            conn.rollback()
+            if exc.code == "thread_not_found":
+                # The expected answer, not a failure. The recency arm selects
+                # recent human messages that MAY have gained a first reply since
+                # they left the overlap, and most never started a thread at all:
+                # measured live, 275 of 279 due candidates. Slack says so with
+                # thread_not_found, and counting that as an error reported a
+                # clean pass as 26 failures. Stamped like a completed walk so it
+                # rotates on the normal cadence instead of sorting NULLS FIRST
+                # on every pass; a reply that lands later is caught on the next
+                # re-check inside the active window.
+                stats.swept_threads += 1
+                _mark_swept(conn, channel_id, thread_ts)
+                conn.commit()
+                continue
             # One unreadable thread must not end the sweep.
             stats.errors += 1
             logger.warning(
                 "thread sweep failed", channel=channel_id, thread_ts=thread_ts, error=str(exc)
             )
-            conn.rollback()
             continue
 
         stats.replies += ingested
