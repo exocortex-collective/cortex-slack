@@ -242,25 +242,32 @@ def _parent(conn: psycopg2.extensions.connection, ts: str, replies: int, channel
 
 
 class _ThreadClient(_Client):
+    """Both answers conversations.replies gives.
+
+    A message that never started a thread is NOT an error: Slack returns ok
+    with the parent alone, which walk_thread ignores, so [] stands in for it.
+    thread_not_found is what Slack says for a message it no longer has; the
+    fake says it only for a ts it was told is gone.
+    """
+
     def __init__(
         self,
         replies: dict[str, list[dict[str, Any]]] | None = None,
         *,
         messages: list[dict[str, Any]] | None = None,
+        gone: set[str] | None = None,
     ) -> None:
         super().__init__(messages or [])
         self._replies = replies or {}
+        self._gone = gone or set()
         self.walked: list[str] = []
 
     def replies(self, channel: str, thread_ts: str) -> list[dict[str, Any]]:
         validate_ts(thread_ts, field="thread_ts")
         self.walked.append(thread_ts)
-        if thread_ts not in self._replies:
-            # What Slack does for a message that never started a thread. The
-            # fake returned [] here, so the suite could not see that the sweep
-            # walks mostly non-parents and was counting every one as an error.
+        if thread_ts in self._gone:
             raise SlackError("conversations.replies", "thread_not_found")
-        return self._replies[thread_ts]
+        return self._replies.get(thread_ts, [])
 
 
 def test_a_thread_missing_replies_is_swept_whatever_its_age(
@@ -520,13 +527,18 @@ def test_a_thread_walked_in_the_channel_pass_is_not_swept_again_the_same_pass(
     assert client.walked == [parent], f"walked twice in one pass: {client.walked}"
 
 
-def test_a_recent_message_with_no_thread_is_not_an_error(
-    clean: psycopg2.extensions.connection,
-) -> None:
-    """The recency arm asks Slack about messages that may have gained a first reply.
+def _stamped(conn: psycopg2.extensions.connection, ts: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT thread_swept_at FROM slack_messages_raw WHERE ts = %s", (ts,))
+        row = cur.fetchone()
+    return row is not None and row[0] is not None
 
-    Most never started a thread, and Slack answers thread_not_found. Measured
-    live: 275 of 279 due candidates, reported as 26 errors on a clean pass.
+
+def test_a_threadless_message_walks_clean(clean: psycopg2.extensions.connection) -> None:
+    """The common case: the recency arm checks a message that has no thread.
+
+    Slack answers ok with the parent alone. 646 of these in a week, every
+    one stamped by an ordinary successful walk -- this is not the error case.
     """
     _channel(clean)
     lonely = _recent_ts(3600)
@@ -538,27 +550,75 @@ def test_a_recent_message_with_no_thread_is_not_an_error(
 
     stats = poll_once(clean, client)  # type: ignore[arg-type]
 
-    assert client.walked == [lonely], "the recency arm did not check it"
-    assert stats.errors == 0, "a message with no thread was counted as a failure"
-    with clean.cursor() as cur:
-        cur.execute("SELECT thread_swept_at FROM slack_messages_raw WHERE ts = %s", (lonely,))
-        row = cur.fetchone()
-    assert row is not None and row[0] is not None, "not stamped, so it sorts first on every pass"
+    assert client.walked == [lonely]
+    assert (stats.errors, stats.replies, stats.missing_threads) == (0, 0, 0)
+    assert stats.swept_threads == 1 and _stamped(clean, lonely)
 
 
-def test_a_first_reply_is_still_caught_after_a_thread_not_found(
+def test_a_message_slack_no_longer_has_is_not_an_error(
     clean: psycopg2.extensions.connection,
 ) -> None:
-    """Stamping thread_not_found must not stop the re-check the arm exists for."""
+    """thread_not_found means the message is gone from the workspace.
+
+    Measured live: 26 rows, every message in one group DM across two hours,
+    reported as 26 errors on a clean pass and, unstamped, taking 26 of the 40
+    sweep slots on every pass after.
+    """
+    _channel(clean)
+    gone = _recent_ts(3600)
+    from cortex_slack.ingest import ingest_message
+
+    ingest_message(clean, C1, _msg(gone), source="poll", enqueue_parse=False)
+    clean.commit()
+    client = _ThreadClient(gone={gone})
+
+    stats = poll_once(clean, client)  # type: ignore[arg-type]
+
+    assert client.walked == [gone]
+    assert stats.errors == 0, "a vanished message was counted as a failure"
+    assert stats.missing_threads == 1 and stats.swept_threads == 0, (
+        "walked nothing, counted as a walk"
+    )
+    assert _stamped(clean, gone), "not stamped, so it sorts first on every pass"
+
+
+def test_a_vanished_short_thread_is_released_from_the_short_arm(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """The provably-short arm has no age gate and no stamp gate.
+
+    A parent that claims more replies than we hold is selected on every pass
+    regardless -- so a thread that vanished from Slack while short would be
+    walked every five minutes forever. Clamping the claim to what we hold
+    releases it; the recency arm still re-checks inside its window.
+    """
+    _channel(clean)
+    old = "1600000000.000001"  # far outside the recency window: only arm 1 can select it
+    _parent(clean, old, replies=3)
+    client = _ThreadClient(gone={old})
+
+    poll_once(clean, client)  # type: ignore[arg-type]
+    poll_once(clean, client)  # type: ignore[arg-type]
+
+    assert client.walked == [old], f"re-walked a thread Slack no longer has: {client.walked}"
+    with clean.cursor() as cur:
+        cur.execute("SELECT reply_count FROM slack_messages_raw WHERE ts = %s", (old,))
+        row = cur.fetchone()
+    assert row is not None and row[0] == 0, "the stale claim was kept"
+
+
+def test_a_message_that_comes_back_is_re_walked_on_the_next_check(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """Stamping a vanished message must not stop the re-check inside the window."""
     _channel(clean)
     parent = _recent_ts(3600)
     from cortex_slack.ingest import ingest_message
 
     ingest_message(clean, C1, _msg(parent), source="poll", enqueue_parse=False)
     clean.commit()
-    poll_once(clean, _ThreadClient())  # type: ignore[arg-type]  -- thread_not_found, stamped
+    poll_once(clean, _ThreadClient(gone={parent}))  # type: ignore[arg-type]
 
-    # Six hours pass and someone replies.
     with clean.cursor() as cur:
         cur.execute(
             "UPDATE slack_messages_raw SET thread_swept_at = NOW() - interval '7 hours' "
@@ -570,7 +630,7 @@ def test_a_first_reply_is_still_caught_after_a_thread_not_found(
     stats = poll_once(clean, _ThreadClient({parent: [reply]}))  # type: ignore[arg-type]
 
     assert stats.replies == 1 and stats.errors == 0
-    assert _stored(clean) == 2, "the first reply was never fetched"
+    assert _stored(clean) == 2, "the thread came back and its reply was never fetched"
 
 
 def test_an_unreadable_thread_is_still_an_error(

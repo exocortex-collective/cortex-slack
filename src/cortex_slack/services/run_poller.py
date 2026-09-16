@@ -98,6 +98,7 @@ def main() -> int:
             stored=stats.stored,
             replies=stats.replies,
             swept_threads=stats.swept_threads,
+            missing_threads=stats.missing_threads,
             updated=stats.updated,
             unchanged=stats.unchanged,
             errors=stats.errors,

@@ -112,6 +112,11 @@ SELECT p.channel_id, p.ts
 class PollStats:
     channels: int = 0
     swept_threads: int = 0
+    # Walks Slack refused with thread_not_found: the message is gone from the
+    # workspace. Its own field because "walked and fetched nothing" is a
+    # different fact from "walked", and 26 of these disappearing from one
+    # group DM in two hours is a signal an operator should be able to see.
+    missing_threads: int = 0
     # Replies are their own field, not folded into `stored`. walk_thread counts
     # every reply it walks whatever the outcome, and the sweep re-walks each
     # active thread every six hours -- so adding them to `stored` reported the
@@ -212,17 +217,26 @@ def sweep_threads(
         except SlackError as exc:
             conn.rollback()
             if exc.code == "thread_not_found":
-                # The expected answer, not a failure. The recency arm selects
-                # recent human messages that MAY have gained a first reply since
-                # they left the overlap, and most never started a thread at all:
-                # measured live, 275 of 279 due candidates. Slack says so with
-                # thread_not_found, and counting that as an error reported a
-                # clean pass as 26 failures. Stamped like a completed walk so it
-                # rotates on the normal cadence instead of sorting NULLS FIRST
-                # on every pass; a reply that lands later is caught on the next
-                # re-check inside the active window.
-                stats.swept_threads += 1
-                _mark_swept(conn, channel_id, thread_ts)
+                # Slack no longer has this message. NOT "it never started a
+                # thread": conversations.replies answers ok for a threadless
+                # message, with the parent alone, and 646 of those were swept
+                # cleanly in a week. Measured live, thread_not_found was 26
+                # rows, every message in one group DM across a two-hour
+                # stretch, two of them threads whose replies we already hold
+                # in full. Nothing to fetch, so it is not an error -- but it
+                # was counted as one on every pass, and left unstamped it
+                # sorted NULLS FIRST and took 26 of the 40 slots every time.
+                #
+                # Stamped so the recency arm re-checks on its six-hour cadence
+                # (if the message comes back, so do its replies), and the
+                # stored reply count is clamped to what we hold so the
+                # provably-short arm, which has no age gate and no stamp gate,
+                # stops re-walking a vanished thread every five minutes. If
+                # the message reappears, the parent conversations.replies
+                # returns refreshes reply_count and that arm re-arms.
+                stats.missing_threads += 1
+                logger.info("thread gone from slack", channel=channel_id, thread_ts=thread_ts)
+                _mark_gone(conn, channel_id, thread_ts)
                 conn.commit()
                 continue
             # One unreadable thread must not end the sweep.
@@ -242,6 +256,24 @@ def sweep_threads(
             # incomplete thread.
             _mark_swept(conn, channel_id, thread_ts)
         conn.commit()
+
+
+def _mark_gone(conn: psycopg2.extensions.connection, channel_id: str, thread_ts: str) -> None:
+    """Stamp a vanished parent and release it from the provably-short arm."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE slack_messages_raw p
+               SET thread_swept_at = NOW(),
+                   reply_count = LEAST(
+                       p.reply_count,
+                       (SELECT count(*) FROM slack_messages_raw r
+                         WHERE r.channel_id = p.channel_id
+                           AND r.thread_ts = p.ts AND r.ts <> p.ts))
+             WHERE p.channel_id = %s AND p.ts = %s
+            """,
+            (channel_id, thread_ts),
+        )
 
 
 def _mark_swept(conn: psycopg2.extensions.connection, channel_id: str, thread_ts: str) -> None:
