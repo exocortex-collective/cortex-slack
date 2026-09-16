@@ -1,0 +1,31 @@
+-- Which raw version a parsed row came from, so a rewrite is always re-parsed.
+--
+-- The work predicate was "parsed_at < fetched_at": one clock, but NOW() is
+-- pinned at transaction start, and the poller holds one transaction across a
+-- whole channel. A raw row rewritten late in that transaction carries a
+-- fetched_at from its start. If the parse worker parsed the old version in
+-- between, its parsed_at is later than that fetched_at, the rewrite commits,
+-- and the predicate says "current" forever -- reproduced: raw text v2, parsed
+-- text v1, and nothing would ever revisit it.
+--
+-- So the parser copies the fetched_at it read into parsed_from, and the
+-- predicate asks whether the raw row still carries that value. A rewrite in
+-- any other transaction changes fetched_at, and equality does not care which
+-- of two timestamps is larger.
+--
+-- Just the column, deliberately. A backfill UPDATE here would rewrite every
+-- parsed row -- 1,553,283 in production, a hash join of two seq scans and a
+-- non-HOT rewrite of a 291MB heap plus five indexes -- inside the single boot
+-- transaction that holds ACCESS EXCLUSIVE on three tables, for minutes, with
+-- no lock_timeout anywhere. The parse worker does the same rewrite without
+-- the lock: NULL is distinct from every fetched_at, so it re-versions existing
+-- rows in committed 2,000-row batches, about seven minutes of parse CPU once.
+-- It is the same 1.55M non-HOT tuple versions across the heap and five
+-- indexes -- expect the table to roughly double until autovacuum reclaims
+-- it -- but no reader waits on it, and nothing re-scans on later boots.
+ALTER TABLE slack_messages ADD COLUMN IF NOT EXISTS parsed_from TIMESTAMPTZ;
+
+-- An earlier revision of this file created a partial index to serve a
+-- per-boot re-scan that no longer exists. A no-op everywhere but a database
+-- that ran that revision, and a lone DROP IF EXISTS does not rebuild anything.
+DROP INDEX IF EXISTS idx_slack_messages_unversioned;

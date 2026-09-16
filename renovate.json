@@ -1,0 +1,12 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "description": "cortex-utils is pinned to a SHA and bumped deliberately, not on a schedule: a bump changes queue semantics across every service at once.",
+      "matchPackageNames": ["cortex-utils"],
+      "enabled": false
+    }
+  ]
+}

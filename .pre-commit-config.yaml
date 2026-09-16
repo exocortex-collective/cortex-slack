@@ -1,0 +1,26 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # MUST match the ruff in uv.lock. At v0.6.9 against the project's 0.16.6,
+    # the two disagreed about wrapping `assert x, (...)`: every commit was
+    # formatted by the venv's ruff, silently reformatted back by this hook, and
+    # then failed `ruff format --check` in CI, which uses the locked version.
+    # Twenty consecutive red runs, unwinnable until the versions agree.
+    rev: v0.16.6
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      # Meeting summaries and verbatim transcripts pass through this repo's
+      # working tree during export testing. A private key or an API token
+      # reaching a commit here is the failure mode worth a hook.
+      - id: detect-private-key
