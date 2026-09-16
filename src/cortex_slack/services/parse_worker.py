@@ -88,9 +88,10 @@ def parse_batch(
         # End the transaction the SELECT opened. psycopg2 starts one on the
         # first statement, so returning here without this leaves the connection
         # "idle in transaction" holding ACCESS SHARE on slack_messages -- which
-        # blocks any ALTER TABLE forever. Observed: a sibling worker's
-        # apply_schema() waited on an AccessExclusiveLock that was never granted
-        # because this worker was politely idling with a transaction open.
+        # blocks any ALTER TABLE forever. Observed: a sibling worker booting
+        # with an unapplied migration waited on an AccessExclusiveLock that was
+        # never granted, because this worker was politely idling with a
+        # transaction open.
         conn.rollback()
         return 0, None
 

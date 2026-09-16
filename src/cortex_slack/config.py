@@ -25,7 +25,15 @@ MIGRATIONS_TABLE = "slack_schema_migrations"
 # this, revived by the restart policy -- the crash-loop shape this codebase
 # disavows everywhere else. Postgres kills exactly one side of a deadlock, so
 # the other proceeds and a retry here succeeds once it has finished.
-DEADLOCK_RETRIES = 5
+#
+# Four retries, doubling from half a second: 0.5, 1, 2, 4. The ladder is capped
+# so no single sleep approaches Docker's 10-second stop grace. time.sleep()
+# resumes across a signal (PEP 475, see run_poller.STOP_POLL_SECONDS), and the
+# handlers are installed before apply_schema runs, so a docker stop during a
+# long backoff would wait it out and then begin another replay transaction
+# only to be SIGKILLed mid-way. Harmless to data -- the transaction rolls back
+# -- but a shape this codebase has already been bitten by.
+DEADLOCK_RETRIES = 4
 DEADLOCK_FIRST_DELAY_S = 0.5
 
 # Slack's browser-session tokens. Phase 1 only: an internal Slack app replaces
@@ -119,7 +127,7 @@ def apply_schema(conn: psycopg2.extensions.connection) -> None:
                 "schema apply deadlocked with another session; retrying",
                 attempt=attempt + 1,
                 delay_s=delay,
-                error=str(exc).splitlines()[0],
+                error=str(exc).split("\n", 1)[0],
             )
             time.sleep(delay)
             continue

@@ -61,6 +61,23 @@ def test_a_migration_runs_once_and_a_new_one_runs_on_the_next_boot(
         "CREATE TABLE slack_probe (n INT); INSERT INTO slack_probe VALUES (1);",
     )
     later = ("901_probe_two.sql", "INSERT INTO slack_probe VALUES (2);")
+
+    def _drop_probe() -> None:
+        # rollback FIRST: a failed apply_schema leaves the connection in an
+        # aborted transaction, where the DROP itself raises and the probe table
+        # -- committed by the first boot -- survives to fail every later run.
+        # Reproduced: a mutation check left slack_probe behind and the suite
+        # was red until someone dropped it by hand. Run before as well as
+        # after, so a poisoned database cannot poison this run.
+        clean.rollback()
+        with clean.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS slack_probe")
+            cur.execute(
+                f"DELETE FROM {MIGRATIONS_TABLE} WHERE name IN (%s, %s)", (probe[0], later[0])
+            )
+        clean.commit()
+
+    _drop_probe()
     try:
         monkeypatch.setattr(config, "migrations", lambda: [*real, probe])
         apply_schema(clean)
@@ -76,12 +93,7 @@ def test_a_migration_runs_once_and_a_new_one_runs_on_the_next_boot(
         assert {probe[0], later[0]} <= _recorded(clean)
         assert {name for name, _ in real} <= _recorded(clean), "the real files were not recorded"
     finally:
-        with clean.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS slack_probe")
-            cur.execute(
-                f"DELETE FROM {MIGRATIONS_TABLE} WHERE name IN (%s, %s)", (probe[0], later[0])
-            )
-        clean.commit()
+        _drop_probe()
 
 
 def test_a_recorded_migration_is_not_executed_again(
@@ -96,12 +108,20 @@ def test_a_recorded_migration_is_not_executed_again(
     """
     poison = ("950_recorded_elsewhere.sql", "SELECT 1/0")
     with clean.cursor() as cur:
-        cur.execute(f"INSERT INTO {MIGRATIONS_TABLE} (name) VALUES (%s)", (poison[0],))
+        # ON CONFLICT: a previous failed run leaves the row behind, and this
+        # test must then fail at its assertion, not at its setup.
+        cur.execute(
+            f"INSERT INTO {MIGRATIONS_TABLE} (name) VALUES (%s) ON CONFLICT DO NOTHING",
+            (poison[0],),
+        )
     clean.commit()
     monkeypatch.setattr(config, "migrations", lambda: [*migrations(), poison])
     try:
-        apply_schema(clean)  # raises DivisionByZero if the recorded file is executed
+        # The assertion is "did not raise": executing the recorded file raises
+        # DivisionByZero, and nothing else in apply_schema can.
+        apply_schema(clean)
     finally:
+        clean.rollback()  # a failure leaves the transaction aborted; end it first
         with clean.cursor() as cur:
             cur.execute(f"DELETE FROM {MIGRATIONS_TABLE} WHERE name = %s", (poison[0],))
         clean.commit()
@@ -121,6 +141,12 @@ def test_a_deadlock_at_boot_is_retried_not_fatal(
     def _deadlock_once(conn: Any) -> list[str]:
         calls["n"] += 1
         if calls["n"] == 1:
+            # Leave the connection the way a real deadlock does: inside an
+            # aborted transaction. Raising from a clean connection would let a
+            # retry loop with no rollback pass this test and then fail in
+            # production with InFailedSqlTransaction -- a slower crash.
+            with conn.cursor() as cur, pytest.raises(psycopg2.errors.DivisionByZero):
+                cur.execute("SELECT 1/0")
             raise psycopg2.errors.DeadlockDetected("deadlock detected")
         return real_apply(conn)
 

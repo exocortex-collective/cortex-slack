@@ -325,10 +325,10 @@ def store_pending(
     # End the transaction psycopg2 opened on that SELECT. Without this the
     # connection sits "idle in transaction" through the 60s idle wait and the
     # 600s discovery interval, holding ACCESS SHARE on slack_files and
-    # slack_messages_raw -- measured live at 4m26s. Any container booting runs
-    # apply_schema(), whose ALTER TABLE needs ACCESS EXCLUSIVE, and Postgres'
-    # lock queue is FIFO: that ALTER waits, and every later reader and writer
-    # queues behind it, stalling the poller and the parse worker.
+    # slack_messages_raw -- measured live at 4m26s. Any container booting with
+    # an unapplied migration runs its ALTER TABLE, which needs ACCESS EXCLUSIVE,
+    # and Postgres' lock queue is FIFO: that ALTER waits, and every later reader
+    # and writer queues behind it, stalling the poller and the parse worker.
     #
     # This is the same fault the parse worker had, reintroduced here by the fix
     # that made this worker wait instead of exiting -- process exit used to
