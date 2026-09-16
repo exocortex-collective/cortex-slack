@@ -97,14 +97,15 @@ def apply_schema(conn: psycopg2.extensions.connection) -> None:
     as long as the caller's transaction ran.
 
     Tracked by filename in slack_schema_migrations, so a boot against a current
-    database executes no DDL at all. It used to re-run every file on every
+    database takes no table lock: a no-op CREATE TABLE IF NOT EXISTS on the
+    ledger, then one SELECT. It used to re-run every file on every
     boot, and ALTER TABLE ... ADD COLUMN IF NOT EXISTS takes ACCESS EXCLUSIVE
     even when the column exists -- held to commit, across tables in file order.
     A sibling worker's ordinary query locking those tables in the other order
     deadlocked with it on the very first production redeploy, and both services
     came back only because Docker restarted them. On a database that predates
     the tracking table every file runs once more, exactly as before, and is
-    recorded; after that a boot is one SELECT.
+    recorded; after that a boot runs no migration DDL.
 
     The lock is not decoration. `CREATE TABLE IF NOT EXISTS` is not safe against
     a concurrent identical CREATE: both sessions pass the existence check, and

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import psycopg2
 import pytest
 
@@ -138,7 +136,7 @@ def test_a_deadlock_at_boot_is_retried_not_fatal(
     real_apply = config._apply_pending
     calls = {"n": 0}
 
-    def _deadlock_once(conn: Any) -> list[str]:
+    def _deadlock_once(conn: psycopg2.extensions.connection) -> list[str]:
         calls["n"] += 1
         if calls["n"] == 1:
             # Leave the connection the way a real deadlock does: inside an
@@ -161,7 +159,7 @@ def test_a_deadlock_at_boot_is_retried_not_fatal(
 def test_a_deadlock_that_never_clears_is_raised(
     clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def _always(conn: Any) -> list[str]:
+    def _always(conn: psycopg2.extensions.connection) -> list[str]:
         raise psycopg2.errors.DeadlockDetected("deadlock detected")
 
     monkeypatch.setattr(config, "_apply_pending", _always)

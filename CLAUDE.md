@@ -126,7 +126,7 @@ runtime `pytest.skip()` in a fixture sails past and the run still exits 0.
 
 `src/cortex_slack/migrations/*.sql` are applied by `apply_schema()` at every
 service boot, once each, recorded by filename in `slack_schema_migrations`.
-A boot against a current database runs no DDL. Consequences:
+A boot against a current database runs no migration DDL. Consequences:
 
 - A schema change is a **new file**. Editing a file that has already been
   applied does nothing anywhere it has run, production included.
