@@ -112,6 +112,11 @@ def ingest_message(
     # message that gained its first reply after it left the poll's overlap
     # window. Measured: zero parents where stored < claimed, i.e. the sweep's
     # self-correcting arm had never once been able to fire.
+    #
+    # One exception to "Slack's latest claim": when Slack reports the message
+    # gone, the sweep clamps this column to the replies actually held (see
+    # poller._mark_gone) so its short-thread arm releases the row. The
+    # payload's own reply_count is untouched, and the parsed tier reads that.
     reply_count = int(message.get("reply_count") or 0)
     # Also lifted out of the payload, and for a second reason beyond symmetry:
     # the sweep's "is this thread short" question cannot be indexed against a

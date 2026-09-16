@@ -654,3 +654,39 @@ def test_an_unreadable_thread_is_still_an_error(
         cur.execute("SELECT thread_swept_at FROM slack_messages_raw WHERE ts = %s", (parent,))
         row = cur.fetchone()
     assert row is not None and row[0] is None, "a failed walk was stamped as swept"
+
+
+@pytest.mark.parametrize(("claimed", "held", "expected"), [(2, 2, 2), (3, 1, 1)])
+def test_the_vanished_claim_is_clamped_to_what_is_held_not_zeroed(
+    clean: psycopg2.extensions.connection, claimed: int, held: int, expected: int
+) -> None:
+    """LEAST(claim, held), not zero.
+
+    Both production parents in the vanished band were held in full, which a
+    held=0 test cannot tell from "set to zero". A full hold keeps the claim; a
+    partial hold takes what is held; either way the short arm is released.
+    """
+    _channel(clean)
+    old = "1600000000.000001"
+    _parent(clean, old, replies=claimed)
+    from cortex_slack.ingest import ingest_message
+
+    for i in range(1, held + 1):
+        ingest_message(
+            clean,
+            C1,
+            _msg(f"160000000{i}.000001", thread_ts=old),
+            source="poll",
+            enqueue_parse=False,
+        )
+    clean.commit()
+    client = _ThreadClient(gone={old})
+
+    poll_once(clean, client)  # type: ignore[arg-type]
+    poll_once(clean, client)  # type: ignore[arg-type]
+
+    with clean.cursor() as cur:
+        cur.execute("SELECT reply_count FROM slack_messages_raw WHERE ts = %s", (old,))
+        row = cur.fetchone()
+    assert row is not None and row[0] == expected
+    assert client.walked.count(old) <= 1, "still selected by the short arm after the clamp"
