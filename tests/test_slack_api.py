@@ -18,6 +18,7 @@ from cortex_slack.slack.api import (
     SlackAuthError,
     SlackClient,
     SlackError,
+    SlackTransportError,
     validate_ts,
 )
 
@@ -295,7 +296,7 @@ def test_a_persistent_transport_failure_leaves_as_a_slack_error(
     with pytest.raises(SlackError) as caught:
         client._post("conversations.history", {"channel": "C1"})
 
-    assert not isinstance(caught.value, SlackAuthError)
+    assert isinstance(caught.value, SlackTransportError), "the backfill needs to tell these apart"
     assert type(exc).__name__ in caught.value.code
     assert attempts["n"] == 3, "the budget was not spent before giving up"
     assert slept == [1.0, 2.0], "backoff did not double"
@@ -316,7 +317,49 @@ def test_http_errors_still_take_the_http_path(monkeypatch: pytest.MonkeyPatch) -
         ),
     )
 
-    with pytest.raises(urllib.error.HTTPError):
+    with pytest.raises(SlackError) as caught:
         client._post("conversations.history", {"channel": "C1"})
 
+    assert caught.value.code == "HTTP 404"
+    assert not isinstance(caught.value, SlackTransportError), "a 404 is about the request"
     assert slept == [], "a 404 was retried as a transport failure"
+
+
+def test_a_server_error_that_outlives_the_budget_is_a_slack_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Slack outage is when the budget runs out, and raw HTTPError is an OSError.
+
+    It passed poll_once's except SlackError and would have ended the process
+    on exactly the failure an outage produces.
+    """
+    client = _client(max_retries=2)
+    _quiet_sleep(monkeypatch)
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(
+            urllib.error.HTTPError("https://x", 503, "down", {}, None)  # type: ignore[arg-type]
+        ),
+    )
+
+    with pytest.raises(SlackError) as caught:
+        client._post("conversations.history", {"channel": "C1"})
+
+    assert caught.value.code == "HTTP 503"
+
+
+@pytest.mark.parametrize("body", [b"[1, 2]", b'"just a string"', b"\xff\xfe not utf-8"])
+def test_a_body_that_is_not_a_json_object_is_a_slack_error(
+    monkeypatch: pytest.MonkeyPatch, body: bytes
+) -> None:
+    client = _client(max_retries=0)
+    _quiet_sleep(monkeypatch)
+
+    class _Odd(_OkResponse):
+        def read(self) -> bytes:
+            return body
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Odd())
+
+    with pytest.raises(SlackError):
+        client._post("conversations.history", {"channel": "C1"})

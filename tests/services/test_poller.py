@@ -423,7 +423,7 @@ def test_the_sweep_watermark_does_not_advance_on_a_failed_walk(
     over an incomplete thread.
     """
     _channel(clean)
-    old = "1789000000.000001"
+    old = "1600000000.000001"  # far outside the recency window: only the short arm can select it
     _parent(clean, old, replies=1)
     from cortex_slack import threads
 

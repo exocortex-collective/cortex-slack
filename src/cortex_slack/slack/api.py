@@ -51,7 +51,10 @@ DEFAULT_BURST = 3
 # same max_retries the HTTP path uses -- so five retries span about half a
 # minute, long enough that each samples a different moment of an outage.
 TRANSPORT_FIRST_DELAY_S = 1.0
-TRANSPORT_MAX_DELAY_S = 30.0
+# 1 * 2**4: the largest delay the default budget of five retries produces. A
+# higher cap would describe a wait that cannot happen, which retry.py already
+# had to correct once; it binds only for a caller passing max_retries >= 6.
+TRANSPORT_MAX_DELAY_S = 16.0
 
 # Slack caps this at 1000 for apps that are allowed it. Asking for more than the
 # server permits is not an error -- it silently returns fewer -- so pagination
@@ -75,7 +78,12 @@ class AdminMethodRefused(RuntimeError):
 
 
 class SlackError(RuntimeError):
-    """An `ok: false` response, carrying Slack's own error code."""
+    """A failed call. `code` is Slack's error string when there was one, else a short reason.
+
+    The one type the poller's per-channel handler contains, so every failure
+    _post can produce is this or a subclass -- an HTTP status Slack would not
+    retry, a body that was not JSON, a socket that dropped, or `ok: false`.
+    """
 
     def __init__(self, method: str, code: str) -> None:
         super().__init__(f"{method}: {code}")
@@ -89,6 +97,16 @@ class SlackAuthError(SlackError):
     Separate from SlackError because a stealth token expiring is the expected
     end of phase 1, not a fault: the caller should stop and say so plainly
     rather than burn its retry budget.
+    """
+
+
+class SlackTransportError(SlackError):
+    """The network, not the request. Retrying later can succeed.
+
+    Its own subclass so the backfill can tell "this conversation cannot be read"
+    (mark the job failed) from "the network was down for half a minute" (release
+    the job with its cursor and resume). SlackError carries no disposition, and
+    retry.py's preamble is a record of what conflating the two costs.
     """
 
 
@@ -195,24 +213,31 @@ class SlackClient:
                 with urllib.request.urlopen(  # nosec B310 - scheme checked in __init__
                     request, timeout=self._timeout
                 ) as response:
-                    payload: dict[str, Any] = json.loads(response.read())
+                    payload = json.loads(response.read())
             except urllib.error.HTTPError as exc:
                 delay = _retry_after(exc)
                 if delay is None or attempt == self._max_retries:
-                    raise
+                    # As a SlackError, not raw. HTTPError is an OSError, so it
+                    # passed poll_once's handler and would have ended the
+                    # process on a 5xx that outlived the budget -- a Slack
+                    # outage being precisely when that happens.
+                    raise SlackError(method, f"HTTP {exc.code}") from exc
                 logger.warning(
                     "slack http error, retrying", method=method, status=exc.code, delay_s=delay
                 )
                 time.sleep(delay)
                 continue
-            except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+            except (OSError, http.client.HTTPException, ValueError) as exc:
                 # Below HTTP: the connect failed, the socket dropped mid-read, or
-                # the body stopped before it was JSON. All transient by nature,
-                # none of them a statement about the request. Ordered after
-                # HTTPError on purpose -- HTTPError is a URLError is an OSError,
-                # and the reverse order would swallow every 4xx and 5xx here.
+                # the body stopped before it was JSON. ValueError rather than
+                # JSONDecodeError because json.loads on non-UTF-8 bytes raises
+                # UnicodeDecodeError, a ValueError that is not a JSONDecodeError.
+                # All transient by nature, none a statement about the request.
+                # Ordered after HTTPError on purpose -- HTTPError is a URLError
+                # is an OSError, and the reverse order would swallow every 4xx
+                # and 5xx here.
                 if attempt == self._max_retries:
-                    raise SlackError(
+                    raise SlackTransportError(
                         method,
                         f"transport failed after {attempt + 1} attempts: "
                         f"{type(exc).__name__}: {exc}",
@@ -227,22 +252,35 @@ class SlackClient:
                 time.sleep(delay)
                 continue
 
-            if payload.get("ok"):
-                return payload
-
-            code = str(payload.get("error", "unknown"))
-            if code in _AUTH_CODES:
-                raise SlackAuthError(method, code)
-            if code == "ratelimited" and attempt < self._max_retries:
-                # Slack can signal this in the body with a 200, not only as a
-                # 429, so the HTTPError branch above does not cover it.
-                delay = float(payload.get("retry_after", 30))
-                logger.warning("slack ratelimited, retrying", method=method, delay_s=delay)
-                time.sleep(delay)
-                continue
-            raise SlackError(method, code)
+            result = self._interpret(method, payload, retry_allowed=attempt < self._max_retries)
+            if result is not None:
+                return result
 
         raise SlackError(method, "retries exhausted")
+
+    def _interpret(
+        self, method: str, payload: Any, *, retry_allowed: bool
+    ) -> dict[str, Any] | None:
+        """Turn a decoded body into a result, an exception, or None meaning "try again".
+
+        None is returned only for a body-level `ratelimited`, after sleeping
+        the interval Slack asked for. Slack can signal that in the body with a
+        200, not only as a 429, so the HTTPError path does not cover it.
+        """
+        if not isinstance(payload, dict):
+            raise SlackError(method, f"non-object response: {type(payload).__name__}")
+        if payload.get("ok"):
+            return payload
+
+        code = str(payload.get("error", "unknown"))
+        if code in _AUTH_CODES:
+            raise SlackAuthError(method, code)
+        if code == "ratelimited" and retry_allowed:
+            delay = float(payload.get("retry_after", 30))
+            logger.warning("slack ratelimited, retrying", method=method, delay_s=delay)
+            time.sleep(delay)
+            return None
+        raise SlackError(method, code)
 
     def _paginate(self, method: str, key: str, params: dict[str, Any]) -> Iterator[dict[str, Any]]:
         """Walk a cursor-paginated collection.

@@ -21,7 +21,12 @@ import psycopg2
 from cortex_utils.logging import get_logger
 
 from cortex_slack.ingest import Outcome, ingest_message
-from cortex_slack.slack.api import SlackAuthError, SlackClient, SlackError
+from cortex_slack.slack.api import (
+    SlackAuthError,
+    SlackClient,
+    SlackError,
+    SlackTransportError,
+)
 from cortex_slack.threads import starts_a_thread, walk_thread
 
 logger = get_logger(__name__)
@@ -139,6 +144,13 @@ def run_next_job(conn: psycopg2.extensions.connection, client: SlackClient) -> C
         # perfectly good conversation failed.
         _release(conn, job_id, str(exc))
         raise
+    except SlackTransportError as exc:
+        # The network, not the conversation. Failing the job would re-seed it
+        # with a fresh row and no cursor, re-reading the channel from the top;
+        # releasing keeps the cursor so the next run resumes where this stopped.
+        _release(conn, job_id, str(exc))
+        logger.warning("backfill interrupted by the network", channel=channel_id, job=job_id)
+        return ChannelResult(channel_id, errors=1)
     except SlackError as exc:
         _fail(conn, job_id, str(exc))
         logger.error("backfill failed", channel=channel_id, job=job_id, error=str(exc))

@@ -13,7 +13,7 @@ import pytest
 
 from cortex_slack.services import backfill
 from cortex_slack.services.backfill import run_next_job, seed_jobs
-from cortex_slack.slack.api import SlackAuthError, SlackError, validate_ts
+from cortex_slack.slack.api import SlackAuthError, SlackError, SlackTransportError, validate_ts
 
 C1 = "C0AAAAAAA"
 C2 = "C0BBBBBBB"
@@ -593,3 +593,41 @@ def test_the_watermark_is_the_newest_top_level_message_not_the_newest_reply(
     assert result is not None and result.clean
     assert _stored(clean, C1) == [parent["ts"], late_reply["ts"]]
     assert _watermark(clean, C1) == parent["ts"], "watermark advanced to a reply"
+
+
+def test_a_network_failure_releases_the_job_with_its_cursor(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """The network, not the conversation.
+
+    Marking the job failed re-seeds it with no cursor and the channel is read
+    from the top again. A released job keeps its cursor and the next run
+    resumes where the outage stopped it.
+    """
+    seed_jobs(clean, [{"id": C1}])
+    client = _PagedClient(
+        [[_msg("1725379200.000001")], [_msg("1725379100.000002")]],
+        fail_on_page=1,
+        error=SlackTransportError("conversations.history", "transport failed: BrokenPipeError"),
+    )
+
+    result = run_next_job(clean, client)  # type: ignore[arg-type]
+
+    assert result is not None and result.errors == 1
+    status, cursor, _ = _job(clean, C1)
+    assert status == "pending", "a network blip failed the job for good"
+    assert cursor == "1", "the cursor was lost with the release"
+
+
+def test_a_slack_refusal_still_fails_the_job(clean: psycopg2.extensions.connection) -> None:
+    """The other half: an error about the conversation is terminal for the job."""
+    seed_jobs(clean, [{"id": C1}])
+    client = _PagedClient(
+        [[_msg("1725379200.000001")]],
+        fail_on_page=0,
+        error=SlackError("conversations.history", "channel_not_found"),
+    )
+
+    run_next_job(clean, client)  # type: ignore[arg-type]
+
+    assert _job(clean, C1)[0] == "failed"
