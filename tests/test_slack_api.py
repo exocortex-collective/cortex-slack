@@ -6,6 +6,10 @@ timestamp validation, pagination that stops early, and the admin refusal.
 
 from __future__ import annotations
 
+import http.client
+import json
+import urllib.error
+
 import pytest
 
 from cortex_slack.slack.api import (
@@ -209,3 +213,110 @@ def test_auth_failures_are_their_own_type(monkeypatch: pytest.MonkeyPatch) -> No
 
     assert caught.value.code == "invalid_auth"
     assert isinstance(caught.value, SlackError), "callers catching SlackError must still see it"
+
+
+class _OkResponse:
+    def read(self) -> bytes:
+        return b'{"ok": true, "messages": []}'
+
+    def __enter__(self) -> _OkResponse:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+
+def _quiet_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    slept: list[float] = []
+    monkeypatch.setattr("cortex_slack.slack.api.time.sleep", slept.append)
+    return slept
+
+
+def test_a_dropped_socket_is_retried_and_the_call_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A BrokenPipeError from the TLS layer killed the poller.
+
+    It is not an HTTPError, so the only retry clause did not see it; it is not
+    a SlackError, so poll_once's per-channel handler did not either. It left
+    main() and the container restarted -- the crash-loop recovery this codebase
+    disavows. Measured: one restart on the first pass after a deploy.
+    """
+    client = _client(max_retries=2)
+    slept = _quiet_sleep(monkeypatch)
+    attempts = {"n": 0}
+
+    def _flaky(*_a: object, **_k: object) -> _OkResponse:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise BrokenPipeError(32, "Broken pipe")
+        return _OkResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", _flaky)
+
+    payload = client._post("conversations.history", {"channel": "C1"})
+
+    assert payload["ok"] is True
+    assert attempts["n"] == 2
+    assert slept == [1.0], "no backoff between attempts"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        BrokenPipeError(32, "Broken pipe"),
+        ConnectionResetError(54, "reset"),
+        TimeoutError("timed out"),
+        urllib.error.URLError("name resolution failed"),
+        http.client.RemoteDisconnected("closed"),
+        http.client.IncompleteRead(b""),
+        json.JSONDecodeError("truncated", "", 0),
+    ],
+    ids=lambda e: type(e).__name__,
+)
+def test_a_persistent_transport_failure_leaves_as_a_slack_error(
+    monkeypatch: pytest.MonkeyPatch, exc: Exception
+) -> None:
+    """Whatever fails below HTTP, the caller sees the one type it handles.
+
+    Ordered after the HTTPError clause on purpose: HTTPError is a URLError is
+    an OSError, so the reverse order would retry every 4xx as a transport blip.
+    """
+    client = _client(max_retries=2)
+    slept = _quiet_sleep(monkeypatch)
+    attempts = {"n": 0}
+
+    def _always(*_a: object, **_k: object) -> object:
+        attempts["n"] += 1
+        raise exc
+
+    monkeypatch.setattr("urllib.request.urlopen", _always)
+
+    with pytest.raises(SlackError) as caught:
+        client._post("conversations.history", {"channel": "C1"})
+
+    assert not isinstance(caught.value, SlackAuthError)
+    assert type(exc).__name__ in caught.value.code
+    assert attempts["n"] == 3, "the budget was not spent before giving up"
+    assert slept == [1.0, 2.0], "backoff did not double"
+
+
+def test_http_errors_still_take_the_http_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 404 is an HTTPError is a URLError is an OSError.
+
+    If the transport clause caught it first, every client error would be
+    retried as a network blip and then reported as one.
+    """
+    client = _client(max_retries=2)
+    slept = _quiet_sleep(monkeypatch)
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(
+            urllib.error.HTTPError("https://x", 404, "nope", {}, None)  # type: ignore[arg-type]
+        ),
+    )
+
+    with pytest.raises(urllib.error.HTTPError):
+        client._post("conversations.history", {"channel": "C1"})
+
+    assert slept == [], "a 404 was retried as a transport failure"

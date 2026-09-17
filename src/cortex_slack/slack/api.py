@@ -15,6 +15,7 @@ fix written down in advance.
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import time
@@ -44,6 +45,13 @@ TS_PATTERN = re.compile(r"^\d{10}\.\d{6}\Z")
 # client itself does rather than near what the documentation permits.
 DEFAULT_RATE_PER_SECOND = 1.0
 DEFAULT_BURST = 3
+
+# Backoff for a failure below HTTP: a dropped TLS socket, a reset, a timeout,
+# a body that stopped arriving. Doubling from one second, capped, across the
+# same max_retries the HTTP path uses -- so five retries span about half a
+# minute, long enough that each samples a different moment of an outage.
+TRANSPORT_FIRST_DELAY_S = 1.0
+TRANSPORT_MAX_DELAY_S = 30.0
 
 # Slack caps this at 1000 for apps that are allowed it. Asking for more than the
 # server permits is not an error -- it silently returns fewer -- so pagination
@@ -146,11 +154,20 @@ class SlackClient:
         self._bucket = _TokenBucket(rate, burst)
 
     def _post(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        """One API call, with rate limiting and 429-aware retries.
+        """One API call, with rate limiting and retries. Raises SlackError, never below it.
 
         Refuses admin endpoints outright. Every request in this client goes
         through here, so the check cannot be sidestepped by adding a method
         later and forgetting the rule.
+
+        Every failure leaves here as a SlackError (or the AuthError subclass),
+        because that is the one type the poller's per-channel handler contains.
+        A BrokenPipeError from the TLS socket used to leave as itself: it
+        passed the HTTPError clause, passed poll_once's `except SlackError`,
+        left main(), and the process died -- to be revived by the restart
+        policy, which is the crash-loop shape this codebase spent a PR removing
+        from gmail-sync. Measured: one restart, on the first pass after a
+        deploy, for a single dropped socket.
         """
         if method.startswith("admin."):
             raise AdminMethodRefused(
@@ -185,6 +202,27 @@ class SlackClient:
                     raise
                 logger.warning(
                     "slack http error, retrying", method=method, status=exc.code, delay_s=delay
+                )
+                time.sleep(delay)
+                continue
+            except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+                # Below HTTP: the connect failed, the socket dropped mid-read, or
+                # the body stopped before it was JSON. All transient by nature,
+                # none of them a statement about the request. Ordered after
+                # HTTPError on purpose -- HTTPError is a URLError is an OSError,
+                # and the reverse order would swallow every 4xx and 5xx here.
+                if attempt == self._max_retries:
+                    raise SlackError(
+                        method,
+                        f"transport failed after {attempt + 1} attempts: "
+                        f"{type(exc).__name__}: {exc}",
+                    ) from exc
+                delay = min(TRANSPORT_MAX_DELAY_S, TRANSPORT_FIRST_DELAY_S * 2**attempt)
+                logger.warning(
+                    "slack transport error, retrying",
+                    method=method,
+                    error=type(exc).__name__,
+                    delay_s=delay,
                 )
                 time.sleep(delay)
                 continue
