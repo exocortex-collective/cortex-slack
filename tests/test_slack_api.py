@@ -24,6 +24,14 @@ from cortex_slack.slack.api import (
 
 
 def _client(**kwargs: object) -> SlackClient:
+    # A burst no test will exhaust, so _TokenBucket.take() never reaches its
+    # own time.sleep. _quiet_sleep rebinds time.sleep process-wide -- the module
+    # attribute IS the time module -- which turns take()'s `while True` into a
+    # spin on the real clock: measured at rate=1.0/burst=3, the fourth take()
+    # burned 1.0s of CPU and appended 9,232,510 entries to the slept list. Every
+    # test here used max_retries=2, exactly DEFAULT_BURST attempts, so the suite
+    # passed one attempt from the edge.
+    kwargs.setdefault("burst", 1000)
     return SlackClient(
         "xoxc-test",
         "xoxd-test",
@@ -325,13 +333,15 @@ def test_http_errors_still_take_the_http_path(monkeypatch: pytest.MonkeyPatch) -
     assert slept == [], "a 404 was retried as a transport failure"
 
 
-def test_a_server_error_that_outlives_the_budget_is_a_slack_error(
+def test_a_server_error_that_outlives_the_budget_is_a_transport_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A Slack outage is when the budget runs out, and raw HTTPError is an OSError.
+    """An exhausted 5xx is the network, not the conversation.
 
-    It passed poll_once's except SlackError and would have ended the process
-    on exactly the failure an outage produces.
+    Raw, it was an OSError that passed poll_once's except SlackError and ended
+    the process. As a plain SlackError it instead made the backfill mark the
+    job failed, losing the cursor and re-reading the whole conversation from
+    page 1 -- where before this PR the BaseException arm had released it.
     """
     client = _client(max_retries=2)
     _quiet_sleep(monkeypatch)
@@ -342,10 +352,11 @@ def test_a_server_error_that_outlives_the_budget_is_a_slack_error(
         ),
     )
 
-    with pytest.raises(SlackError) as caught:
+    with pytest.raises(SlackTransportError) as caught:
         client._post("conversations.history", {"channel": "C1"})
 
-    assert caught.value.code == "HTTP 503"
+    assert "HTTP 503" in caught.value.code
+    assert "3 attempts" in caught.value.code
 
 
 @pytest.mark.parametrize("body", [b"[1, 2]", b'"just a string"', b"\xff\xfe not utf-8"])
@@ -394,7 +405,7 @@ def test_a_body_ratelimit_is_retried_after_the_interval_slack_asked_for(
     assert slept == [7.0]
 
 
-def test_a_body_ratelimit_that_outlives_the_budget_is_a_slack_error(
+def test_a_body_ratelimit_that_outlives_the_budget_is_a_transport_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client = _client(max_retries=2)
@@ -402,11 +413,10 @@ def test_a_body_ratelimit_that_outlives_the_budget_is_a_slack_error(
     _Bodies.queue = [b'{"ok": false, "error": "ratelimited", "retry_after": 7}'] * 3
     monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Bodies())
 
-    with pytest.raises(SlackError) as caught:
+    with pytest.raises(SlackTransportError) as caught:
         client._post("conversations.history", {"channel": "C1"})
 
-    assert caught.value.code == "ratelimited"
-    assert not isinstance(caught.value, SlackTransportError)
+    assert "ratelimited" in caught.value.code
     assert slept == [7.0, 7.0], "the last attempt must not sleep"
 
 
@@ -424,3 +434,49 @@ def test_a_malformed_retry_after_falls_back_to_the_default(
 
     assert client._post("conversations.history", {"channel": "C1"})["ok"] is True
     assert slept == [30.0]
+
+
+@pytest.mark.parametrize("retry_after", [-1, "nan", "inf", "-inf", 10_000, None], ids=str)
+def test_a_retry_after_time_sleep_would_refuse_falls_back(
+    monkeypatch: pytest.MonkeyPatch, retry_after: object
+) -> None:
+    """Parsing is not enough.
+
+    -1, nan and inf all float() cleanly and then time.sleep raises ValueError,
+    ValueError and OverflowError -- and OverflowError is not a ValueError, so
+    it escaped every handler in the module. This runs outside _post's try.
+    """
+    client = _client(max_retries=1)
+    slept = _quiet_sleep(monkeypatch)
+    value = "null" if retry_after is None else json.dumps(retry_after)
+    _Bodies.queue = [
+        b'{"ok": false, "error": "ratelimited", "retry_after": ' + value.encode() + b"}",
+        b'{"ok": true}',
+    ]
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Bodies())
+
+    assert client._post("conversations.history", {"channel": "C1"})["ok"] is True
+    assert slept == [30.0]
+
+
+def test_the_backoff_series_survives_more_attempts_than_the_default_burst(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Four attempts against a DEFAULT_BURST of three.
+
+    Every other test sits exactly at the burst, so none of them would notice
+    _quiet_sleep neutering the token bucket's own sleep -- which turns take()
+    into a spin appending millions of entries to the very list these
+    assertions read.
+    """
+    client = _client(max_retries=3)
+    slept = _quiet_sleep(monkeypatch)
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(BrokenPipeError(32, "Broken pipe")),
+    )
+
+    with pytest.raises(SlackTransportError):
+        client._post("conversations.history", {"channel": "C1"})
+
+    assert slept == [1.0, 2.0, 4.0], "the token bucket leaked into the backoff series"

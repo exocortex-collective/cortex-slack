@@ -49,7 +49,14 @@ DEFAULT_BURST = 3
 # Backoff for a failure below HTTP: a dropped TLS socket, a reset, a timeout,
 # a body that stopped arriving. Doubling from one second, capped, across the
 # same max_retries the HTTP path uses -- so five retries span about half a
-# minute, long enough that each samples a different moment of an outage.
+# minute of SLEEP, long enough that each samples a different moment of an
+# outage.
+#
+# Sleep is not elapsed time. Each attempt may also spend up to `timeout`
+# seconds (60 by default) waiting on the socket, so one _post can occupy
+# (max_retries + 1) * timeout + 31s of wall clock -- and run_poller only reads
+# the stop flag between passes, so a stop during a pass waits that out.
+# Cortex-b4o.20 tracks giving the client a deadline.
 TRANSPORT_FIRST_DELAY_S = 1.0
 # 1 * 2**4: the largest delay the default budget of five retries produces. A
 # higher cap would describe a wait that cannot happen, which retry.py already
@@ -60,6 +67,11 @@ TRANSPORT_MAX_DELAY_S = 16.0
 # server permits is not an error -- it silently returns fewer -- so pagination
 # never assumes a full page means more pages.
 PAGE_LIMIT = 200
+
+
+# A delay this client will honour. Beyond it, something upstream is confused
+# and the default is a better guess than obeying it.
+MAX_RETRY_AFTER_S = 300.0
 
 
 class AdminMethodRefused(RuntimeError):
@@ -215,13 +227,7 @@ class SlackClient:
                 ) as response:
                     payload = json.loads(response.read())
             except urllib.error.HTTPError as exc:
-                delay = _retry_after(exc)
-                if delay is None or attempt == self._max_retries:
-                    # As a SlackError, not raw. HTTPError is an OSError, so it
-                    # passed poll_once's handler and would have ended the
-                    # process on a 5xx that outlived the budget -- a Slack
-                    # outage being precisely when that happens.
-                    raise SlackError(method, f"HTTP {exc.code}") from exc
+                delay = self._http_retry_delay(method, exc, attempt)
                 logger.warning(
                     "slack http error, retrying", method=method, status=exc.code, delay_s=delay
                 )
@@ -258,6 +264,30 @@ class SlackClient:
 
         raise SlackError(method, "retries exhausted")
 
+    def _http_retry_delay(self, method: str, exc: urllib.error.HTTPError, attempt: int) -> float:
+        """Seconds to wait before retrying an HTTP failure, or raise if it is over.
+
+        Two dispositions, which _retry_after already separates and an earlier
+        version of this collapsed. A status Slack will not change its mind about
+        -- 404, 400, any 4xx but 429 -- is terminal. A 429 or 5xx that outlives
+        the budget is the network being unavailable, the same disposition as a
+        dropped socket, so it raises the transport type and the backfill
+        releases the job with its cursor instead of failing it and re-reading
+        the conversation from page 1.
+
+        Either way it leaves as a SlackError. Raw, it was an OSError that passed
+        poll_once's handler and ended the process -- a Slack outage being
+        precisely when that happens.
+        """
+        delay = _retry_after(exc)
+        if delay is None:
+            raise SlackError(method, f"HTTP {exc.code}") from exc
+        if attempt == self._max_retries:
+            raise SlackTransportError(
+                method, f"HTTP {exc.code} after {attempt + 1} attempts"
+            ) from exc
+        return delay
+
     def _interpret(
         self, method: str, payload: Any, *, retry_allowed: bool
     ) -> dict[str, Any] | None:
@@ -275,14 +305,16 @@ class SlackClient:
         code = str(payload.get("error", "unknown"))
         if code in _AUTH_CODES:
             raise SlackAuthError(method, code)
-        if code == "ratelimited" and retry_allowed:
-            # Guarded like the header twin in _retry_after: this runs outside
-            # _post's try, so a non-numeric retry_after would leave as a raw
-            # ValueError, the one class of leak the docstring rules out.
-            try:
-                delay = float(payload.get("retry_after", 30))
-            except (TypeError, ValueError):
-                delay = 30.0
+        if code == "ratelimited":
+            if not retry_allowed:
+                # Rate limiting is the one 4xx retry.py singles out as "a retry
+                # fixes this", so an exhausted budget is the network, not the
+                # request -- the backfill must keep its cursor.
+                raise SlackTransportError(method, "ratelimited past the retry budget")
+            # Clamped, not merely parsed: this runs outside _post's try, so a
+            # value time.sleep refuses would leave as a raw ValueError or
+            # OverflowError -- the class of leak the docstring rules out.
+            delay = sleep_seconds(payload.get("retry_after"))
             logger.warning("slack ratelimited, retrying", method=method, delay_s=delay)
             time.sleep(delay)
             return None
@@ -387,11 +419,27 @@ class SlackClient:
 def _retry_after(exc: urllib.error.HTTPError) -> float | None:
     """Seconds to wait, or None if this error is not worth retrying."""
     if exc.code == 429:
-        raw = exc.headers.get("Retry-After") if exc.headers else None
-        try:
-            return float(raw) if raw else 30.0
-        except ValueError:
-            return 30.0
+        return sleep_seconds(exc.headers.get("Retry-After") if exc.headers else None)
     if 500 <= exc.code < 600:
         return 5.0
     return None
+
+
+def sleep_seconds(raw: Any, default: float = 30.0) -> float:
+    """A delay someone else asked for, made safe to hand to time.sleep().
+
+    Parsing is not enough. -1, "nan" and "inf" all float() cleanly and then
+    time.sleep raises ValueError, ValueError and OverflowError respectively --
+    and OverflowError is not a ValueError, so it escapes every handler in this
+    module. Retry-After reaches us from any intermediary, not only from Slack,
+    and the body's retry_after is whatever the response said.
+
+    The range check also rejects NaN, which compares false against everything.
+    """
+    try:
+        delay = default if raw is None else float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not 0.0 <= delay <= MAX_RETRY_AFTER_S:
+        return default
+    return delay
