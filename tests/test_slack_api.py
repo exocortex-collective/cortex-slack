@@ -13,7 +13,7 @@ import urllib.error
 import pytest
 
 from cortex_slack.slack.api import (
-    MAX_RETRY_AFTER_S,
+    MAX_SLEEP_BUDGET_S,
     TS_PATTERN,
     AdminMethodRefused,
     SlackAuthError,
@@ -345,7 +345,7 @@ def test_a_server_error_that_outlives_the_budget_is_a_transport_error(
     page 1 -- where before this PR the BaseException arm had released it.
     """
     client = _client(max_retries=2)
-    _quiet_sleep(monkeypatch)
+    slept = _quiet_sleep(monkeypatch)
     monkeypatch.setattr(
         "urllib.request.urlopen",
         lambda *a, **k: (_ for _ in ()).throw(
@@ -358,6 +358,10 @@ def test_a_server_error_that_outlives_the_budget_is_a_transport_error(
 
     assert "HTTP 503" in caught.value.code
     assert "3 attempts" in caught.value.code
+    # The 5xx delay was asserted by nothing: 5.0 -> 50.0 left the suite green.
+    # Flat rather than doubling, unlike the transport arm it shares a
+    # disposition with. Deliberate, and now visible if it changes.
+    assert slept == [5.0, 5.0]
 
 
 def _answering(monkeypatch: pytest.MonkeyPatch, body: bytes) -> None:
@@ -513,22 +517,42 @@ def test_a_retry_after_that_says_nothing_usable_takes_the_default(
     assert slept == [30.0]
 
 
-@pytest.mark.parametrize("retry_after", [10_000, "inf"], ids=str)
-def test_a_retry_after_longer_than_the_ceiling_is_capped_not_discarded(
+@pytest.mark.parametrize("retry_after", [61, 10_000, "inf"], ids=str)
+def test_a_retry_after_longer_than_the_budget_reschedules_instead_of_sleeping(
     monkeypatch: pytest.MonkeyPatch, retry_after: object
 ) -> None:
-    """ "Wait an hour" must not become "wait thirty seconds".
+    """Waiting this long costs more than coming back.
 
-    Falling back to the default here retried six times in two and a half
-    minutes against a host that asked for an hour -- more aggressive than
-    obeying it, on a session token with no published allowance. inf takes this
-    path too, which is what keeps it away from time.sleep's OverflowError.
+    Measured before this: a body ratelimit carrying 3600 slept 300s per attempt
+    and 1500s across the budget, in bare uninterruptible calls -- five times the
+    whole poll interval, with the stop flag unread. Both callers resume for
+    free, so raising gives the same recovery and keeps the process answerable to
+    SIGTERM. inf takes this path too, which keeps it away from time.sleep.
     """
     client = _client(max_retries=1)
     slept = _ratelimited_once(monkeypatch, retry_after)
 
+    with pytest.raises(SlackTransportError) as caught:
+        client._post("conversations.history", {"channel": "C1"})
+
+    assert "resuming later" in caught.value.code
+    assert slept == [], "slept instead of rescheduling"
+
+
+def test_the_sleep_budget_is_a_minute(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pinned to the literal, not to the constant.
+
+    Both sides of `assert slept == [MAX_SLEEP_BUDGET_S]` move together, so
+    changing the ceiling to anything at all still passed -- and the ceiling is
+    the number deciding how long the process can be unanswerable.
+    """
+    assert MAX_SLEEP_BUDGET_S == 60.0
+
+    client = _client(max_retries=1)
+    slept = _ratelimited_once(monkeypatch, 60)
+
     assert client._post("conversations.history", {"channel": "C1"})["ok"] is True
-    assert slept == [MAX_RETRY_AFTER_S]
+    assert slept == [60.0], "a delay exactly at the budget must still be honoured"
 
 
 def test_the_backoff_series_survives_more_attempts_than_the_default_burst(
@@ -567,9 +591,8 @@ def _http_error(code: int, headers: dict[str, str] | None = None) -> urllib.erro
         # RFC 7231 permits an HTTP-date here, which float() refuses. Slack sends
         # seconds, but Retry-After reaches us from any intermediary.
         ({"Retry-After": "Wed, 17 Sep 2026 21:00:00 GMT"}, 30.0),
-        ({"Retry-After": "99999"}, MAX_RETRY_AFTER_S),
     ],
-    ids=["seconds", "absent", "garbage", "http-date", "over-ceiling"],
+    ids=["seconds", "absent", "garbage", "http-date"],
 )
 def test_a_429_honours_the_retry_after_header(
     monkeypatch: pytest.MonkeyPatch, header: dict[str, str], expected: float
@@ -594,3 +617,58 @@ def test_a_429_honours_the_retry_after_header(
 
     assert client._post("conversations.history", {"channel": "C1"})["ok"] is True
     assert slept == [expected]
+
+
+def test_a_429_asking_longer_than_the_budget_reschedules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The header half of the budget check.
+
+    The body half had a test; this one did not, and deleting the check left the
+    suite green. A 429 carrying a very large Retry-After is the shape that
+    produced the 1500s measurement.
+    """
+    client = _client(max_retries=2)
+    slept = _quiet_sleep(monkeypatch)
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(_http_error(429, {"Retry-After": "99999"})),
+    )
+
+    with pytest.raises(SlackTransportError) as caught:
+        client._post("conversations.history", {"channel": "C1"})
+
+    assert "resuming later" in caught.value.code
+    assert slept == [], "slept instead of rescheduling"
+
+
+def test_the_rate_limiter_throttles_once_the_burst_is_spent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_TokenBucket.take() had no test of its own at all.
+
+    A bare `return` as its first statement left the whole suite green, here and
+    on main. It is what keeps an un-allowanced stealth session near what the
+    browser client does, and round 3 raised the fixture's burst to 1000
+    precisely so that no other test can reach its sleep.
+    """
+    from cortex_slack.slack.api import _TokenBucket
+
+    now = {"t": 1000.0}
+    slept: list[float] = []
+
+    def _sleep(seconds: float) -> None:
+        slept.append(seconds)
+        now["t"] += seconds
+
+    monkeypatch.setattr("cortex_slack.slack.api.time.monotonic", lambda: now["t"])
+    monkeypatch.setattr("cortex_slack.slack.api.time.sleep", _sleep)
+    bucket = _TokenBucket(rate=2.0, burst=2)
+
+    bucket.take()
+    bucket.take()
+    assert slept == [], "the burst is meant to be spendable without waiting"
+
+    bucket.take()
+
+    assert slept == [pytest.approx(0.5)], "one token at 2/s is half a second"

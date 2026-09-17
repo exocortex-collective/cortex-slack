@@ -54,9 +54,15 @@ DEFAULT_BURST = 3
 #
 # Sleep is not elapsed time. Each attempt may also spend up to `timeout`
 # seconds (60 by default) waiting on the socket, so one _post can occupy
-# (max_retries + 1) * timeout + 31s of wall clock -- and run_poller only reads
-# the stop flag between passes, so a stop during a pass waits that out.
-# Cortex-b4o.20 tracks giving the client a deadline.
+# (max_retries + 1) * timeout on top of whatever it sleeps -- and run_poller
+# only reads the stop flag between passes, so a stop during a pass waits that
+# out. Cortex-b4o.20 tracks making the wait interruptible.
+#
+# This bound covers the transport arm only. The sleeps the SERVER asks for --
+# a 429's Retry-After, a body-level retry_after -- were unbounded by anything
+# but MAX_SLEEP_BUDGET_S below. Measured at the production defaults before it
+# existed: a plain 429 with no header slept 150s across the budget, and one
+# carrying Retry-After: 99999 slept 1500s, in bare uninterruptible calls.
 TRANSPORT_FIRST_DELAY_S = 1.0
 # 1 * 2**4: the largest delay the default budget of five retries produces. A
 # higher cap would describe a wait that cannot happen, which retry.py already
@@ -69,13 +75,16 @@ TRANSPORT_MAX_DELAY_S = 16.0
 PAGE_LIMIT = 200
 
 
-# The longest delay this client will honour. A larger request is CLAMPED to
-# this, not replaced by the default: falling back to 30s on `Retry-After: 3600`
-# retried six times in two and a half minutes against a host that asked for an
-# hour -- more aggressive than either obeying the value or capping it, and the
-# wrong direction to err on a stealth session token with no published
-# allowance.
-MAX_RETRY_AFTER_S = 300.0
+# The longest this client will sleep at a server's request. Beyond it, waiting
+# costs more than rescheduling: both callers resume for free -- the backfill
+# releases the job with its cursor, the poller moves to the next channel -- and
+# a bare time.sleep is not interruptible, since PEP 475 resumes it past a
+# signal. So a longer request raises instead, and the work comes back on the
+# next pass rather than inside an unanswerable process.
+#
+# Still longer than Docker's 10s stop grace; making the wait itself
+# interruptible is Cortex-b4o.20. This bounds the damage, it does not end it.
+MAX_SLEEP_BUDGET_S = 60.0
 
 
 class AdminMethodRefused(RuntimeError):
@@ -266,6 +275,11 @@ class SlackClient:
             if result is not None:
                 return result
 
+        # Unreachable for any max_retries >= 0: every `continue` above is
+        # guarded by `attempt < self._max_retries`, so the final iteration
+        # always returns or raises. Kept because the function must terminate
+        # for the type checker, and because a caller passing a negative
+        # max_retries would otherwise fall off the end returning None.
         raise SlackError(method, "retries exhausted")
 
     def _http_retry_delay(self, method: str, exc: urllib.error.HTTPError, attempt: int) -> float:
@@ -289,6 +303,10 @@ class SlackClient:
         if attempt == self._max_retries:
             raise SlackTransportError(
                 method, f"HTTP {exc.code} after {attempt + 1} attempts"
+            ) from exc
+        if delay > MAX_SLEEP_BUDGET_S:
+            raise SlackTransportError(
+                method, f"HTTP {exc.code} asked for {delay:.0f}s; resuming later"
             ) from exc
         return delay
 
@@ -315,10 +333,12 @@ class SlackClient:
                 # fixes this", so an exhausted budget is the network, not the
                 # request -- the backfill must keep its cursor.
                 raise SlackTransportError(method, "ratelimited past the retry budget")
-            # Clamped, not merely parsed: this runs outside _post's try, so a
-            # value time.sleep refuses would leave as a raw ValueError or
+            # Normalised, not merely parsed: this runs outside _post's try, so
+            # a value time.sleep refuses would leave as a raw ValueError or
             # OverflowError -- the class of leak the docstring rules out.
             delay = sleep_seconds(payload.get("retry_after"))
+            if delay > MAX_SLEEP_BUDGET_S:
+                raise SlackTransportError(method, f"ratelimited for {delay:.0f}s; resuming later")
             logger.warning("slack ratelimited, retrying", method=method, delay_s=delay)
             time.sleep(delay)
             return None
@@ -439,9 +459,11 @@ def sleep_seconds(raw: Any, default: float = 30.0) -> float:
     and the body's retry_after is whatever the response said.
 
     A value that is absent, unparseable, negative or NaN says nothing usable, so
-    it takes the default. A value that is merely too long says something usable
-    -- wait a while -- so it is capped rather than discarded. `inf` lands there
-    too, which is why the cap is what keeps it away from time.sleep.
+    it takes the default. Anything else is returned as asked, including `inf`:
+    deciding whether a usable-but-long delay is worth waiting for belongs to the
+    caller, which has somewhere better to be. Rejecting NaN here is what keeps
+    it out of the caller's comparison, where it would compare false against the
+    budget and reach time.sleep.
     """
     try:
         delay = default if raw is None else float(raw)
@@ -449,4 +471,4 @@ def sleep_seconds(raw: Any, default: float = 30.0) -> float:
         return default
     if delay != delay or delay < 0.0:  # NaN compares false against everything
         return default
-    return min(delay, MAX_RETRY_AFTER_S)
+    return delay
