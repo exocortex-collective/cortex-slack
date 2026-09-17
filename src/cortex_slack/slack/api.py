@@ -276,7 +276,13 @@ class SlackClient:
         if code in _AUTH_CODES:
             raise SlackAuthError(method, code)
         if code == "ratelimited" and retry_allowed:
-            delay = float(payload.get("retry_after", 30))
+            # Guarded like the header twin in _retry_after: this runs outside
+            # _post's try, so a non-numeric retry_after would leave as a raw
+            # ValueError, the one class of leak the docstring rules out.
+            try:
+                delay = float(payload.get("retry_after", 30))
+            except (TypeError, ValueError):
+                delay = 30.0
             logger.warning("slack ratelimited, retrying", method=method, delay_s=delay)
             time.sleep(delay)
             return None

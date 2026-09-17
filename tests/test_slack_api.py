@@ -363,3 +363,64 @@ def test_a_body_that_is_not_a_json_object_is_a_slack_error(
 
     with pytest.raises(SlackError):
         client._post("conversations.history", {"channel": "C1"})
+
+
+class _Bodies(_OkResponse):
+    """Successive response bodies, one per attempt."""
+
+    queue: list[bytes] = []
+
+    def read(self) -> bytes:
+        return self.queue.pop(0)
+
+
+def test_a_body_ratelimit_is_retried_after_the_interval_slack_asked_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slack can say ratelimited in a 200 body, not only as a 429.
+
+    This branch had no test on main or here, and it was moved into
+    _interpret() -- the one path that makes that function return None.
+    """
+    client = _client(max_retries=2)
+    slept = _quiet_sleep(monkeypatch)
+    _Bodies.queue = [
+        b'{"ok": false, "error": "ratelimited", "retry_after": 7}',
+        b'{"ok": true, "messages": []}',
+    ]
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Bodies())
+
+    assert client._post("conversations.history", {"channel": "C1"})["ok"] is True
+    assert slept == [7.0]
+
+
+def test_a_body_ratelimit_that_outlives_the_budget_is_a_slack_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(max_retries=2)
+    slept = _quiet_sleep(monkeypatch)
+    _Bodies.queue = [b'{"ok": false, "error": "ratelimited", "retry_after": 7}'] * 3
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Bodies())
+
+    with pytest.raises(SlackError) as caught:
+        client._post("conversations.history", {"channel": "C1"})
+
+    assert caught.value.code == "ratelimited"
+    assert not isinstance(caught.value, SlackTransportError)
+    assert slept == [7.0, 7.0], "the last attempt must not sleep"
+
+
+def test_a_malformed_retry_after_falls_back_to_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slack documents retry_after as an integer; a malformed one must not leave as ValueError."""
+    client = _client(max_retries=1)
+    slept = _quiet_sleep(monkeypatch)
+    _Bodies.queue = [
+        b'{"ok": false, "error": "ratelimited", "retry_after": "soon"}',
+        b'{"ok": true}',
+    ]
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Bodies())
+
+    assert client._post("conversations.history", {"channel": "C1"})["ok"] is True
+    assert slept == [30.0]

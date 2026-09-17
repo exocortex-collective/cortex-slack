@@ -149,7 +149,9 @@ def run_next_job(conn: psycopg2.extensions.connection, client: SlackClient) -> C
         # with a fresh row and no cursor, re-reading the channel from the top;
         # releasing keeps the cursor so the next run resumes where this stopped.
         _release(conn, job_id, str(exc))
-        logger.warning("backfill interrupted by the network", channel=channel_id, job=job_id)
+        logger.warning(
+            "backfill interrupted by the network", channel=channel_id, job=job_id, error=str(exc)
+        )
         return ChannelResult(channel_id, errors=1)
     except SlackError as exc:
         _fail(conn, job_id, str(exc))
