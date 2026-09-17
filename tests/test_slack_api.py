@@ -402,10 +402,18 @@ def test_a_body_that_is_not_utf8_is_transport(monkeypatch: pytest.MonkeyPatch) -
     """
     client = _client(max_retries=0)
     _quiet_sleep(monkeypatch)
-    _answering(monkeypatch, b"\xff\xfe not utf-8")
+    # NOT b"\xff\xfe ...": that is the UTF-16-LE BOM, and at an even length
+    # json.detect_encoding picks utf-16, the decode SUCCEEDS, and what is
+    # raised is a JSONDecodeError -- making this a duplicate of a case already
+    # covered and leaving the breadth of the except clause unwitnessed.
+    # Narrowing it to JSONDecodeError then passed the whole suite, while a
+    # genuinely undecodable body escaped _post as a raw UnicodeDecodeError.
+    _answering(monkeypatch, b"\x80\x81\x82")
 
-    with pytest.raises(SlackTransportError):
+    with pytest.raises(SlackTransportError) as caught:
         client._post("conversations.history", {"channel": "C1"})
+
+    assert "UnicodeDecodeError" in caught.value.code
 
 
 def test_a_slack_refusal_is_terminal_not_transport(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -591,8 +599,11 @@ def _http_error(code: int, headers: dict[str, str] | None = None) -> urllib.erro
         # RFC 7231 permits an HTTP-date here, which float() refuses. Slack sends
         # seconds, but Retry-After reaches us from any intermediary.
         ({"Retry-After": "Wed, 17 Sep 2026 21:00:00 GMT"}, 30.0),
+        # Exactly at the budget, on the header path. The body path pins this
+        # boundary; without it here, `>` could drift to `>=` on one side only.
+        ({"Retry-After": "60"}, 60.0),
     ],
-    ids=["seconds", "absent", "garbage", "http-date"],
+    ids=["seconds", "absent", "garbage", "http-date", "at-budget"],
 )
 def test_a_429_honours_the_retry_after_header(
     monkeypatch: pytest.MonkeyPatch, header: dict[str, str], expected: float
@@ -639,6 +650,7 @@ def test_a_429_asking_longer_than_the_budget_reschedules(
         client._post("conversations.history", {"channel": "C1"})
 
     assert "resuming later" in caught.value.code
+    assert caught.value.retry_after == 99999.0, "the delay must not vanish with the exception"
     assert slept == [], "slept instead of rescheduling"
 
 
@@ -672,3 +684,39 @@ def test_the_rate_limiter_throttles_once_the_burst_is_spent(
     bucket.take()
 
     assert slept == [pytest.approx(0.5)], "one token at 2/s is half a second"
+
+
+@pytest.mark.parametrize("retry_after", [99999, 120], ids=str)
+def test_a_rescheduled_wait_carries_the_delay_the_server_asked_for(
+    monkeypatch: pytest.MonkeyPatch, retry_after: int
+) -> None:
+    """Raising instead of sleeping must not throw the number away.
+
+    Discarding it turned a request for 99999 seconds of quiet into a re-claim
+    loop measured at 96 requests a minute -- worse for the server than the
+    sleep it replaced.
+    """
+    client = _client(max_retries=1)
+    _ratelimited_once(monkeypatch, retry_after)
+
+    with pytest.raises(SlackTransportError) as caught:
+        client._post("conversations.history", {"channel": "C1"})
+
+    assert caught.value.retry_after == float(retry_after)
+
+
+def test_a_transport_error_with_no_stated_delay_carries_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dropped socket says nothing about when to come back."""
+    client = _client(max_retries=0)
+    _quiet_sleep(monkeypatch)
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(BrokenPipeError(32, "Broken pipe")),
+    )
+
+    with pytest.raises(SlackTransportError) as caught:
+        client._post("conversations.history", {"channel": "C1"})
+
+    assert caught.value.retry_after is None

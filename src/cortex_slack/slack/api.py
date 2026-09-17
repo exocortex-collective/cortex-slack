@@ -132,7 +132,18 @@ class SlackTransportError(SlackError):
     (mark the job failed) from "the network was down for half a minute" (release
     the job with its cursor and resume). SlackError carries no disposition, and
     retry.py's preamble is a record of what conflating the two costs.
+
+    `retry_after` carries the quiet the server explicitly asked for, when it
+    asked for one. Raising instead of sleeping keeps the process answerable to a
+    signal, but discarding the number turned a request for 99999 seconds of
+    quiet into a re-claim loop measured at 96 requests a minute -- worse for the
+    server than the sleep it replaced. The caller decides how to honour it; it
+    must not simply vanish with the exception.
     """
+
+    def __init__(self, method: str, code: str, retry_after: float | None = None) -> None:
+        super().__init__(method, code)
+        self.retry_after = retry_after
 
 
 _AUTH_CODES = frozenset({"invalid_auth", "not_authed", "account_inactive", "token_revoked"})
@@ -306,7 +317,7 @@ class SlackClient:
             ) from exc
         if delay > MAX_SLEEP_BUDGET_S:
             raise SlackTransportError(
-                method, f"HTTP {exc.code} asked for {delay:.0f}s; resuming later"
+                method, f"HTTP {exc.code} asked for {delay:.0f}s; resuming later", delay
             ) from exc
         return delay
 
@@ -338,7 +349,9 @@ class SlackClient:
             # OverflowError -- the class of leak the docstring rules out.
             delay = sleep_seconds(payload.get("retry_after"))
             if delay > MAX_SLEEP_BUDGET_S:
-                raise SlackTransportError(method, f"ratelimited for {delay:.0f}s; resuming later")
+                raise SlackTransportError(
+                    method, f"ratelimited for {delay:.0f}s; resuming later", delay
+                )
             logger.warning("slack ratelimited, retrying", method=method, delay_s=delay)
             time.sleep(delay)
             return None

@@ -22,6 +22,12 @@ from cortex_slack.services.backfill import run_next_job, seed_jobs
 from cortex_slack.services.dimensions import upsert_channels, upsert_users
 from cortex_slack.slack.api import SlackAuthError, SlackClient
 
+# The longest the runner will pause before re-claiming a job the network
+# released. Long enough to stop a hot re-claim loop, short enough that a
+# manually-run backfill stays interruptible -- the client refuses to sleep at
+# all beyond MAX_SLEEP_BUDGET_S for the same reason.
+MAX_RECLAIM_WAIT_S = 60.0
+
 logger = get_logger(__name__)
 
 
@@ -80,6 +86,22 @@ def main() -> int:
         if result is None:
             logger.info("backfill complete", conversations=done, messages=messages)
             return 0
+        if result.retry_after:
+            # _claim orders by created_at and _release does not touch it, so the
+            # job just released is handed straight back. Without this the runner
+            # re-issued the same request immediately: measured at 96 requests a
+            # minute against a server that had asked for 99999 seconds of quiet,
+            # which is worse for the server than the sleep this replaced. Not
+            # counted as a conversation done, because nothing was finished.
+            wait = min(result.retry_after, MAX_RECLAIM_WAIT_S)
+            logger.warning(
+                "waiting before re-claiming the released job",
+                channel=result.channel_id,
+                asked_s=result.retry_after,
+                waiting_s=wait,
+            )
+            time.sleep(wait)
+            continue
         done += 1
         messages += result.seen
         elapsed = time.monotonic() - started

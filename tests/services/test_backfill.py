@@ -631,3 +631,53 @@ def test_a_slack_refusal_still_fails_the_job(clean: psycopg2.extensions.connecti
     run_next_job(clean, client)  # type: ignore[arg-type]
 
     assert _job(clean, C1)[0] == "failed"
+
+
+def test_a_release_after_a_failed_message_keeps_the_cursor_behind_the_gap(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one path that loses a message for good.
+
+    The cursor guard was per-page, so the errored page froze it and the very
+    next clean page recorded ITS cursor -- past the gap. Then the transport
+    release keeps that cursor, the resumed run sees no errors, the job is
+    marked done, and _finish advances the watermark above a message that is not
+    in the archive. Nothing fails and nothing is left to notice.
+    """
+    seed_jobs(clean, [{"id": C1}])
+    bad = "1725379300.000001"
+    client = _PagedClient(
+        [[_msg(bad)], [_msg("1725379200.000001")], [_msg("1725379100.000001")]],
+        fail_on_page=2,
+        error=SlackTransportError("conversations.history", "dropped"),
+    )
+    real_ingest = backfill.ingest_message
+
+    def _fail_the_bad(conn: Any, channel_id: str, message: dict[str, Any], **kw: Any) -> Any:
+        if message["ts"] == bad:
+            raise ValueError("simulated ingest failure")
+        return real_ingest(conn, channel_id, message, **kw)
+
+    monkeypatch.setattr(backfill, "ingest_message", _fail_the_bad)
+
+    run_next_job(clean, client)  # type: ignore[arg-type]
+
+    status, cursor, _ = _job(clean, C1)
+    assert status == "pending", "a network failure should release, not fail, the job"
+    assert cursor is None, "released with a cursor past a message that was never stored"
+
+
+def test_a_released_job_reports_the_delay_the_server_asked_for(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """The runner waits on this before re-claiming; _claim hands the job straight back."""
+    seed_jobs(clean, [{"id": C1}])
+    client = _PagedClient(
+        [[_msg("1725379200.000001")], [_msg("1725379100.000001")]],
+        fail_on_page=1,
+        error=SlackTransportError("conversations.history", "ratelimited", 99999.0),
+    )
+
+    result = run_next_job(clean, client)  # type: ignore[arg-type]
+
+    assert result is not None and result.retry_after == 99999.0

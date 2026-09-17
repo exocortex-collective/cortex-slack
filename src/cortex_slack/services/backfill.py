@@ -55,6 +55,10 @@ class ChannelResult:
     threads: int = 0
     replies: int = 0
     errors: int = 0
+    # Seconds of quiet the server asked for before this walk was cut short, if
+    # it asked. The job is released with its cursor either way; this is what
+    # stops the runner re-claiming it inside the same second.
+    retry_after: float | None = None
 
     @property
     def seen(self) -> int:
@@ -150,9 +154,13 @@ def run_next_job(conn: psycopg2.extensions.connection, client: SlackClient) -> C
         # releasing keeps the cursor so the next run resumes where this stopped.
         _release(conn, job_id, str(exc))
         logger.warning(
-            "backfill interrupted by the network", channel=channel_id, job=job_id, error=str(exc)
+            "backfill interrupted by the network",
+            channel=channel_id,
+            job=job_id,
+            error=str(exc),
+            retry_after=exc.retry_after,
         )
-        return ChannelResult(channel_id, errors=1)
+        return ChannelResult(channel_id, errors=1, retry_after=exc.retry_after)
     except SlackError as exc:
         _fail(conn, job_id, str(exc))
         logger.error("backfill failed", channel=channel_id, job=job_id, error=str(exc))
@@ -191,7 +199,6 @@ def _walk_channel(
     stored = updated = unchanged = threads = replies = errors = 0
 
     for messages, next_cursor in client.history_pages(channel_id, cursor=cursor):
-        errors_before_page = errors
         for message in messages:
             with conn.cursor() as cur:
                 cur.execute("SAVEPOINT msg")
@@ -237,12 +244,22 @@ def _walk_channel(
         # Storing the cursor first would skip this page's messages after a crash;
         # storing it later would re-read them, which is merely wasteful.
         #
-        # A page that errored does NOT advance the cursor. Re-reading it costs
-        # requests; moving past a message that is not in the database cannot be
-        # undone, and a later _release keeps the cursor while discarding the
-        # in-memory error count -- so the next run would see a clean pass and
-        # advance the watermark over the gap.
-        clean_page = errors == errors_before_page
+        # A page that errored does NOT advance the cursor, and neither does any
+        # page after it. Re-reading costs requests; moving past a message that
+        # is not in the database cannot be undone, and a later _release keeps
+        # the cursor while discarding the in-memory error count -- so the next
+        # run would see a clean pass and advance the watermark over the gap.
+        #
+        # `errors == 0`, not `errors == errors_before_page`: the per-page form
+        # froze the cursor for the errored page only, and the very next clean
+        # page recorded ITS next_cursor, which is past the gap. Measured over
+        # four pages with one bad message on page 1 and a transport failure on
+        # page 3: the resumed run requested only page 3, reported clean, was
+        # marked done, and _finish advanced the watermark above a message that
+        # is not in the archive. Nothing failed and nothing was left to notice.
+        # Reachable from an ordinary dropped socket since the transport-release
+        # arm above was added.
+        clean_page = errors == 0
         _record_progress(conn, job_id, stored, next_cursor if clean_page else cursor)
         conn.commit()
         if clean_page:
