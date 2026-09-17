@@ -69,8 +69,12 @@ TRANSPORT_MAX_DELAY_S = 16.0
 PAGE_LIMIT = 200
 
 
-# A delay this client will honour. Beyond it, something upstream is confused
-# and the default is a better guess than obeying it.
+# The longest delay this client will honour. A larger request is CLAMPED to
+# this, not replaced by the default: falling back to 30s on `Retry-After: 3600`
+# retried six times in two and a half minutes against a host that asked for an
+# hour -- more aggressive than either obeying the value or capping it, and the
+# wrong direction to err on a stealth session token with no published
+# allowance.
 MAX_RETRY_AFTER_S = 300.0
 
 
@@ -434,12 +438,15 @@ def sleep_seconds(raw: Any, default: float = 30.0) -> float:
     module. Retry-After reaches us from any intermediary, not only from Slack,
     and the body's retry_after is whatever the response said.
 
-    The range check also rejects NaN, which compares false against everything.
+    A value that is absent, unparseable, negative or NaN says nothing usable, so
+    it takes the default. A value that is merely too long says something usable
+    -- wait a while -- so it is capped rather than discarded. `inf` lands there
+    too, which is why the cap is what keeps it away from time.sleep.
     """
     try:
         delay = default if raw is None else float(raw)
     except (TypeError, ValueError):
         return default
-    if not 0.0 <= delay <= MAX_RETRY_AFTER_S:
+    if delay != delay or delay < 0.0:  # NaN compares false against everything
         return default
-    return delay
+    return min(delay, MAX_RETRY_AFTER_S)

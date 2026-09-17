@@ -13,6 +13,7 @@ import urllib.error
 import pytest
 
 from cortex_slack.slack.api import (
+    MAX_RETRY_AFTER_S,
     TS_PATTERN,
     AdminMethodRefused,
     SlackAuthError,
@@ -359,21 +360,68 @@ def test_a_server_error_that_outlives_the_budget_is_a_transport_error(
     assert "3 attempts" in caught.value.code
 
 
-@pytest.mark.parametrize("body", [b"[1, 2]", b'"just a string"', b"\xff\xfe not utf-8"])
-def test_a_body_that_is_not_a_json_object_is_a_slack_error(
-    monkeypatch: pytest.MonkeyPatch, body: bytes
-) -> None:
-    client = _client(max_retries=0)
-    _quiet_sleep(monkeypatch)
-
+def _answering(monkeypatch: pytest.MonkeyPatch, body: bytes) -> None:
     class _Odd(_OkResponse):
         def read(self) -> bytes:
             return body
 
     monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Odd())
 
-    with pytest.raises(SlackError):
+
+@pytest.mark.parametrize("body", [b"[1, 2]", b'"just a string"'], ids=["array", "scalar"])
+def test_a_json_body_that_is_not_an_object_is_terminal(
+    monkeypatch: pytest.MonkeyPatch, body: bytes
+) -> None:
+    """Valid JSON of the wrong shape is the response being wrong, not the network.
+
+    Asserting only `raises(SlackError)` let this pass as either disposition --
+    and that one statement is what decides whether the backfill fails the job
+    or keeps its cursor.
+    """
+    client = _client(max_retries=0)
+    _quiet_sleep(monkeypatch)
+    _answering(monkeypatch, body)
+
+    with pytest.raises(SlackError) as caught:
         client._post("conversations.history", {"channel": "C1"})
+
+    assert "non-object response" in caught.value.code
+    assert not isinstance(caught.value, SlackTransportError)
+
+
+def test_a_body_that_is_not_utf8_is_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A truncated or corrupted body is the socket, not the response.
+
+    It never reaches the non-object check: json.loads raises UnicodeDecodeError,
+    which the transport clause catches -- the opposite disposition, which the
+    combined test happily accepted.
+    """
+    client = _client(max_retries=0)
+    _quiet_sleep(monkeypatch)
+    _answering(monkeypatch, b"\xff\xfe not utf-8")
+
+    with pytest.raises(SlackTransportError):
+        client._post("conversations.history", {"channel": "C1"})
+
+
+def test_a_slack_refusal_is_terminal_not_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ordinary `ok: false` path, which no test executed.
+
+    It is the single statement deciding _fail (job dead, cursor gone, the whole
+    conversation re-read) against _release (job pending forever, never failed),
+    and flipping its type left all 206 tests green.
+    """
+    client = _client(max_retries=2)
+    slept = _quiet_sleep(monkeypatch)
+    _Bodies.queue = [b'{"ok": false, "error": "channel_not_found"}']
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Bodies())
+
+    with pytest.raises(SlackError) as caught:
+        client._post("conversations.history", {"channel": "C1"})
+
+    assert caught.value.code == "channel_not_found"
+    assert not isinstance(caught.value, SlackTransportError), "the backfill would never fail it"
+    assert slept == [], "a refusal about the conversation was retried"
 
 
 class _Bodies(_OkResponse):
@@ -436,17 +484,8 @@ def test_a_malformed_retry_after_falls_back_to_the_default(
     assert slept == [30.0]
 
 
-@pytest.mark.parametrize("retry_after", [-1, "nan", "inf", "-inf", 10_000, None], ids=str)
-def test_a_retry_after_time_sleep_would_refuse_falls_back(
-    monkeypatch: pytest.MonkeyPatch, retry_after: object
-) -> None:
-    """Parsing is not enough.
-
-    -1, nan and inf all float() cleanly and then time.sleep raises ValueError,
-    ValueError and OverflowError -- and OverflowError is not a ValueError, so
-    it escaped every handler in the module. This runs outside _post's try.
-    """
-    client = _client(max_retries=1)
+def _ratelimited_once(monkeypatch: pytest.MonkeyPatch, retry_after: object) -> list[float]:
+    """Drive one body-level ratelimit carrying `retry_after`, then succeed."""
     slept = _quiet_sleep(monkeypatch)
     value = "null" if retry_after is None else json.dumps(retry_after)
     _Bodies.queue = [
@@ -454,9 +493,42 @@ def test_a_retry_after_time_sleep_would_refuse_falls_back(
         b'{"ok": true}',
     ]
     monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Bodies())
+    return slept
+
+
+@pytest.mark.parametrize("retry_after", [-1, "nan", "-inf", "garbage", None], ids=str)
+def test_a_retry_after_that_says_nothing_usable_takes_the_default(
+    monkeypatch: pytest.MonkeyPatch, retry_after: object
+) -> None:
+    """Parsing is not enough.
+
+    -1 and nan float() cleanly and then time.sleep raises ValueError; these
+    say nothing about how long to wait, so the default is the only guess
+    available. This runs outside _post's try, so an unhandled one leaves raw.
+    """
+    client = _client(max_retries=1)
+    slept = _ratelimited_once(monkeypatch, retry_after)
 
     assert client._post("conversations.history", {"channel": "C1"})["ok"] is True
     assert slept == [30.0]
+
+
+@pytest.mark.parametrize("retry_after", [10_000, "inf"], ids=str)
+def test_a_retry_after_longer_than_the_ceiling_is_capped_not_discarded(
+    monkeypatch: pytest.MonkeyPatch, retry_after: object
+) -> None:
+    """ "Wait an hour" must not become "wait thirty seconds".
+
+    Falling back to the default here retried six times in two and a half
+    minutes against a host that asked for an hour -- more aggressive than
+    obeying it, on a session token with no published allowance. inf takes this
+    path too, which is what keeps it away from time.sleep's OverflowError.
+    """
+    client = _client(max_retries=1)
+    slept = _ratelimited_once(monkeypatch, retry_after)
+
+    assert client._post("conversations.history", {"channel": "C1"})["ok"] is True
+    assert slept == [MAX_RETRY_AFTER_S]
 
 
 def test_the_backoff_series_survives_more_attempts_than_the_default_burst(
@@ -480,3 +552,45 @@ def test_the_backoff_series_survives_more_attempts_than_the_default_burst(
         client._post("conversations.history", {"channel": "C1"})
 
     assert slept == [1.0, 2.0, 4.0], "the token bucket leaked into the backoff series"
+
+
+def _http_error(code: int, headers: dict[str, str] | None = None) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://x", code, "nope", headers or {}, None)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ({"Retry-After": "12"}, 12.0),
+        ({}, 30.0),
+        ({"Retry-After": "garbage"}, 30.0),
+        # RFC 7231 permits an HTTP-date here, which float() refuses. Slack sends
+        # seconds, but Retry-After reaches us from any intermediary.
+        ({"Retry-After": "Wed, 17 Sep 2026 21:00:00 GMT"}, 30.0),
+        ({"Retry-After": "99999"}, MAX_RETRY_AFTER_S),
+    ],
+    ids=["seconds", "absent", "garbage", "http-date", "over-ceiling"],
+)
+def test_a_429_honours_the_retry_after_header(
+    monkeypatch: pytest.MonkeyPatch, header: dict[str, str], expected: float
+) -> None:
+    """The header half of sleep_seconds, which no test executed.
+
+    Replacing the whole expression with a constant left all 206 tests green,
+    and it is the only line in this change whose behaviour differs from main
+    with nothing asserting the difference.
+    """
+    client = _client(max_retries=2)
+    slept = _quiet_sleep(monkeypatch)
+    attempts = {"n": 0}
+
+    def _flaky(*_a: object, **_k: object) -> _OkResponse:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise _http_error(429, header)
+        return _OkResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", _flaky)
+
+    assert client._post("conversations.history", {"channel": "C1"})["ok"] is True
+    assert slept == [expected]
