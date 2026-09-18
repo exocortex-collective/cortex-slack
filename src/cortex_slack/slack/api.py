@@ -313,7 +313,7 @@ class SlackClient:
             raise SlackError(method, f"HTTP {exc.code}") from exc
         if attempt == self._max_retries:
             raise SlackTransportError(
-                method, f"HTTP {exc.code} after {attempt + 1} attempts"
+                method, f"HTTP {exc.code} after {attempt + 1} attempts", delay
             ) from exc
         if delay > MAX_SLEEP_BUDGET_S:
             raise SlackTransportError(
@@ -339,15 +339,19 @@ class SlackClient:
         if code in _AUTH_CODES:
             raise SlackAuthError(method, code)
         if code == "ratelimited":
+            # Normalised, not merely parsed: this runs outside _post's try, so
+            # a value time.sleep refuses would leave as a raw ValueError or
+            # OverflowError -- the class of leak the docstring rules out.
+            # Computed before the budget check so the exhausted path can carry
+            # it too: this class's own docstring says the delay must not vanish
+            # with the exception, and dropping it here left the runner with
+            # nothing to wait on precisely when a server had said how long.
+            delay = sleep_seconds(payload.get("retry_after"))
             if not retry_allowed:
                 # Rate limiting is the one 4xx retry.py singles out as "a retry
                 # fixes this", so an exhausted budget is the network, not the
                 # request -- the backfill must keep its cursor.
-                raise SlackTransportError(method, "ratelimited past the retry budget")
-            # Normalised, not merely parsed: this runs outside _post's try, so
-            # a value time.sleep refuses would leave as a raw ValueError or
-            # OverflowError -- the class of leak the docstring rules out.
-            delay = sleep_seconds(payload.get("retry_after"))
+                raise SlackTransportError(method, "ratelimited past the retry budget", delay)
             if delay > MAX_SLEEP_BUDGET_S:
                 raise SlackTransportError(
                     method, f"ratelimited for {delay:.0f}s; resuming later", delay

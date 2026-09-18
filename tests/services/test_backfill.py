@@ -12,7 +12,7 @@ import psycopg2
 import pytest
 
 from cortex_slack.services import backfill
-from cortex_slack.services.backfill import run_next_job, seed_jobs
+from cortex_slack.services.backfill import ChannelResult, run_next_job, seed_jobs
 from cortex_slack.slack.api import SlackAuthError, SlackError, SlackTransportError, validate_ts
 
 C1 = "C0AAAAAAA"
@@ -681,3 +681,22 @@ def test_a_released_job_reports_the_delay_the_server_asked_for(
     result = run_next_job(clean, client)  # type: ignore[arg-type]
 
     assert result is not None and result.retry_after == 99999.0
+
+
+@pytest.mark.parametrize(
+    ("asked", "expected"),
+    [(None, None), (0.0, None), (5.0, 5.0), (99999.0, 60.0)],
+    ids=["none", "zero", "under-cap", "over-cap"],
+)
+def test_the_reclaim_wait_honours_the_delay_and_caps_it(
+    asked: float | None, expected: float | None
+) -> None:
+    """Nothing imports run_backfill, so this was executed by no test at all.
+
+    Every mutant of the inline version survived 222 green tests, including
+    deleting the wait entirely -- which restores the 96 requests a minute
+    against a server that had asked for 99999 seconds of quiet.
+    """
+    from cortex_slack.services.run_backfill import reclaim_wait
+
+    assert reclaim_wait(ChannelResult(C1, errors=1, retry_after=asked)) == expected

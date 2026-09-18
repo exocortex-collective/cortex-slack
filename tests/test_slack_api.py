@@ -720,3 +720,65 @@ def test_a_transport_error_with_no_stated_delay_carries_none(
         client._post("conversations.history", {"channel": "C1"})
 
     assert caught.value.retry_after is None
+
+
+def test_the_backoff_series_reaches_its_documented_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TRANSPORT_MAX_DELAY_S is commented as 1 * 2**4, and pinned by nothing.
+
+    16.0 -> 4.0 survived the whole suite: the deepest transport test uses
+    max_retries=3 and stops at [1, 2, 4], never reaching the cap, so the
+    comment's arithmetic was unwitnessed at the production default of five.
+    """
+    client = _client(max_retries=5)
+    slept = _quiet_sleep(monkeypatch)
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(BrokenPipeError(32, "Broken pipe")),
+    )
+
+    with pytest.raises(SlackTransportError):
+        client._post("conversations.history", {"channel": "C1"})
+
+    assert slept == [1.0, 2.0, 4.0, 8.0, 16.0]
+    assert sum(slept) == 31.0, "the 31 seconds the module comment claims"
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [({"Retry-After": "30"}, 30.0), ({}, 30.0)],
+    ids=["stated", "unstated"],
+)
+def test_an_exhausted_ratelimit_still_carries_the_delay(
+    monkeypatch: pytest.MonkeyPatch, headers: dict[str, str], expected: float
+) -> None:
+    """The over-budget paths carried it; the exhausted ones dropped it.
+
+    SlackTransportError's docstring says the delay must not vanish with the
+    exception, and the runner's wait is keyed on it being there.
+    """
+    client = _client(max_retries=1)
+    _quiet_sleep(monkeypatch)
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(_http_error(429, headers)),
+    )
+
+    with pytest.raises(SlackTransportError) as caught:
+        client._post("conversations.history", {"channel": "C1"})
+
+    assert caught.value.retry_after == expected
+
+
+def test_a_body_ratelimit_past_the_budget_carries_its_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(max_retries=0)
+    _quiet_sleep(monkeypatch)
+    _Bodies.queue = [b'{"ok": false, "error": "ratelimited", "retry_after": 45}']
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Bodies())
+
+    with pytest.raises(SlackTransportError) as caught:
+        client._post("conversations.history", {"channel": "C1"})
+
+    assert "past the retry budget" in caught.value.code
+    assert caught.value.retry_after == 45.0

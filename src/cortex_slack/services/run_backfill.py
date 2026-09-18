@@ -18,7 +18,7 @@ import psycopg2
 from cortex_utils.logging import configure_logging, get_logger
 
 from cortex_slack.config import apply_schema, dsn_from_env, stealth_tokens
-from cortex_slack.services.backfill import run_next_job, seed_jobs
+from cortex_slack.services.backfill import ChannelResult, run_next_job, seed_jobs
 from cortex_slack.services.dimensions import upsert_channels, upsert_users
 from cortex_slack.slack.api import SlackAuthError, SlackClient
 
@@ -27,6 +27,25 @@ from cortex_slack.slack.api import SlackAuthError, SlackClient
 # manually-run backfill stays interruptible -- the client refuses to sleep at
 # all beyond MAX_SLEEP_BUDGET_S for the same reason.
 MAX_RECLAIM_WAIT_S = 60.0
+
+
+def reclaim_wait(result: ChannelResult) -> float | None:
+    """Seconds to pause before re-claiming, or None to carry straight on.
+
+    Its own function because nothing imports run_backfill: the module is an
+    entry point, the suite never loads it, and all four mutants of the inline
+    version survived 222 green tests -- including deleting the wait entirely,
+    which restores the 96 requests a minute round 6 measured and fixed.
+
+    _claim orders by created_at and _release does not touch it, so a job the
+    network released is handed straight back. Capped because a manually-run
+    backfill has to stay interruptible; the client refuses to sleep past
+    MAX_SLEEP_BUDGET_S for the same reason.
+    """
+    if not result.retry_after:
+        return None
+    return min(result.retry_after, MAX_RECLAIM_WAIT_S)
+
 
 logger = get_logger(__name__)
 
@@ -86,14 +105,8 @@ def main() -> int:
         if result is None:
             logger.info("backfill complete", conversations=done, messages=messages)
             return 0
-        if result.retry_after:
-            # _claim orders by created_at and _release does not touch it, so the
-            # job just released is handed straight back. Without this the runner
-            # re-issued the same request immediately: measured at 96 requests a
-            # minute against a server that had asked for 99999 seconds of quiet,
-            # which is worse for the server than the sleep this replaced. Not
-            # counted as a conversation done, because nothing was finished.
-            wait = min(result.retry_after, MAX_RECLAIM_WAIT_S)
+        wait = reclaim_wait(result)
+        if wait is not None:
             logger.warning(
                 "waiting before re-claiming the released job",
                 channel=result.channel_id,
