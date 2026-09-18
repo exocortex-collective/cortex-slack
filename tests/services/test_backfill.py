@@ -12,8 +12,8 @@ import psycopg2
 import pytest
 
 from cortex_slack.services import backfill
-from cortex_slack.services.backfill import run_next_job, seed_jobs
-from cortex_slack.slack.api import SlackAuthError, SlackError, validate_ts
+from cortex_slack.services.backfill import ChannelResult, run_next_job, seed_jobs
+from cortex_slack.slack.api import SlackAuthError, SlackError, SlackTransportError, validate_ts
 
 C1 = "C0AAAAAAA"
 C2 = "C0BBBBBBB"
@@ -593,3 +593,110 @@ def test_the_watermark_is_the_newest_top_level_message_not_the_newest_reply(
     assert result is not None and result.clean
     assert _stored(clean, C1) == [parent["ts"], late_reply["ts"]]
     assert _watermark(clean, C1) == parent["ts"], "watermark advanced to a reply"
+
+
+def test_a_network_failure_releases_the_job_with_its_cursor(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """The network, not the conversation.
+
+    Marking the job failed re-seeds it with no cursor and the channel is read
+    from the top again. A released job keeps its cursor and the next run
+    resumes where the outage stopped it.
+    """
+    seed_jobs(clean, [{"id": C1}])
+    client = _PagedClient(
+        [[_msg("1725379200.000001")], [_msg("1725379100.000002")]],
+        fail_on_page=1,
+        error=SlackTransportError("conversations.history", "transport failed: BrokenPipeError"),
+    )
+
+    result = run_next_job(clean, client)  # type: ignore[arg-type]
+
+    assert result is not None and result.errors == 1
+    status, cursor, _ = _job(clean, C1)
+    assert status == "pending", "a network blip failed the job for good"
+    assert cursor == "1", "the cursor was lost with the release"
+
+
+def test_a_slack_refusal_still_fails_the_job(clean: psycopg2.extensions.connection) -> None:
+    """The other half: an error about the conversation is terminal for the job."""
+    seed_jobs(clean, [{"id": C1}])
+    client = _PagedClient(
+        [[_msg("1725379200.000001")]],
+        fail_on_page=0,
+        error=SlackError("conversations.history", "channel_not_found"),
+    )
+
+    run_next_job(clean, client)  # type: ignore[arg-type]
+
+    assert _job(clean, C1)[0] == "failed"
+
+
+def test_a_release_after_a_failed_message_keeps_the_cursor_behind_the_gap(
+    clean: psycopg2.extensions.connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one path that loses a message for good.
+
+    The cursor guard was per-page, so the errored page froze it and the very
+    next clean page recorded ITS cursor -- past the gap. Then the transport
+    release keeps that cursor, the resumed run sees no errors, the job is
+    marked done, and _finish advances the watermark above a message that is not
+    in the archive. Nothing fails and nothing is left to notice.
+    """
+    seed_jobs(clean, [{"id": C1}])
+    bad = "1725379300.000001"
+    client = _PagedClient(
+        [[_msg(bad)], [_msg("1725379200.000001")], [_msg("1725379100.000001")]],
+        fail_on_page=2,
+        error=SlackTransportError("conversations.history", "dropped"),
+    )
+    real_ingest = backfill.ingest_message
+
+    def _fail_the_bad(conn: Any, channel_id: str, message: dict[str, Any], **kw: Any) -> Any:
+        if message["ts"] == bad:
+            raise ValueError("simulated ingest failure")
+        return real_ingest(conn, channel_id, message, **kw)
+
+    monkeypatch.setattr(backfill, "ingest_message", _fail_the_bad)
+
+    run_next_job(clean, client)  # type: ignore[arg-type]
+
+    status, cursor, _ = _job(clean, C1)
+    assert status == "pending", "a network failure should release, not fail, the job"
+    assert cursor is None, "released with a cursor past a message that was never stored"
+
+
+def test_a_released_job_reports_the_delay_the_server_asked_for(
+    clean: psycopg2.extensions.connection,
+) -> None:
+    """The runner waits on this before re-claiming; _claim hands the job straight back."""
+    seed_jobs(clean, [{"id": C1}])
+    client = _PagedClient(
+        [[_msg("1725379200.000001")], [_msg("1725379100.000001")]],
+        fail_on_page=1,
+        error=SlackTransportError("conversations.history", "ratelimited", 99999.0),
+    )
+
+    result = run_next_job(clean, client)  # type: ignore[arg-type]
+
+    assert result is not None and result.retry_after == 99999.0
+
+
+@pytest.mark.parametrize(
+    ("asked", "expected"),
+    [(None, None), (0.0, None), (5.0, 5.0), (99999.0, 60.0)],
+    ids=["none", "zero", "under-cap", "over-cap"],
+)
+def test_the_reclaim_wait_honours_the_delay_and_caps_it(
+    asked: float | None, expected: float | None
+) -> None:
+    """Nothing imports run_backfill, so this was executed by no test at all.
+
+    Every mutant of the inline version survived 222 green tests, including
+    deleting the wait entirely -- which restores the 96 requests a minute
+    against a server that had asked for 99999 seconds of quiet.
+    """
+    from cortex_slack.services.run_backfill import reclaim_wait
+
+    assert reclaim_wait(ChannelResult(C1, errors=1, retry_after=asked)) == expected

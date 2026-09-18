@@ -357,7 +357,10 @@ def test_a_thread_started_after_the_parent_left_the_window_is_still_found(
     _channel(clean)
     from cortex_slack.ingest import ingest_message
 
-    old = "1789000000.000001"  # recent enough to be active, outside any overlap
+    # Relative, not a literal: a hardcoded ts from the day this was written
+    # aged out of the seven-day recency window a week later and the test
+    # started failing on main with the sweep untouched.
+    old = _recent_ts(3600)  # recent enough to be active, outside any overlap
     ingest_message(
         clean,
         C1,
@@ -371,13 +374,13 @@ def test_a_thread_started_after_the_parent_left_the_window_is_still_found(
 
     parse_batch(clean)
 
-    reply = _msg("1789000001.000001", thread_ts=old)
+    reply = _msg(_recent_ts(1800), thread_ts=old)
     client = _ThreadClient({old: [reply]})
 
     poll_once(clean, client)  # type: ignore[arg-type]
 
     assert old in client.walked, "a thread started after capture was never swept"
-    assert "1789000001.000001" in [r for r in _stored_ts(clean)], "the reply was not stored"
+    assert reply["ts"] in _stored_ts(clean), "the reply was not stored"
 
 
 def _stored_ts(conn: psycopg2.extensions.connection) -> list[str]:
@@ -420,7 +423,7 @@ def test_the_sweep_watermark_does_not_advance_on_a_failed_walk(
     over an incomplete thread.
     """
     _channel(clean)
-    old = "1789000000.000001"
+    old = "1600000000.000001"  # far outside the recency window: only the short arm can select it
     _parent(clean, old, replies=1)
     from cortex_slack import threads
 
